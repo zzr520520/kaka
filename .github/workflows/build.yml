@@ -1,0 +1,49 @@
+name: Build KakaVoicePro
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      THEOS: /Users/runner/theos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check source present
+        run: |
+          ls -la
+          if [ ! -f KakaVoicePro.m ]; then
+            echo "::error::缺少 KakaVoicePro.m（Tweak.xm 顶部 #import \"KakaVoicePro.m\"），无法编译"
+            exit 1
+          fi
+
+      - name: Setup Theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p "$THEOS/sdks"
+          cp -R /tmp/sdks/iPhoneOS*.sdk "$THEOS/sdks/"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+          ls -1 "$THEOS/sdks"
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Show output
+        if: always()
+        run: find .theos/obj -name '*.dylib' -exec file {} \; || true
+
+      - name: Upload dylib
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KakaVoicePro-dylib
+          path: .theos/obj/**/*.dylib
