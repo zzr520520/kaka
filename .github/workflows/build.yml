@@ -34,6 +34,11 @@ jobs:
           echo "$THEOS/bin" >> "$GITHUB_PATH"
           ls -1 "$THEOS/sdks"
 
+      - name: Install ldid
+        run: |
+          brew install ldid || brew install dpkg || true
+          which ldid || echo "ldid still missing"
+
       - name: Build
         run: make -j"$(sysctl -n hw.ncpu)"
 
