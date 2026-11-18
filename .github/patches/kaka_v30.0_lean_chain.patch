@@ -10,7 +10,8 @@ diff --git a/KakaVoicePro.m b/KakaVoicePro.m
  #define HPF_ALPHA_80HZ 0.9896f
  #define MAX_CHANNELS   8
  #define REVERB_CH      2
-@@ -791,7 +791,7 @@
+@@ -798,7 +798,7 @@
+     return out;
  }
  
 -// 人声前级：低切 → 门限 → 喉腔 → 10 段 EQ → 电子管 → 压缩
@@ -18,7 +19,7 @@ diff --git a/KakaVoicePro.m b/KakaVoicePro.m
  static inline float kp_voice_pre_sample(float inSample, UInt32 ch, const KPFilterBank *bank) {
      float y = inSample;
      if (g_lowCutEnabled) {
-@@ -822,9 +822,9 @@
+@@ -829,9 +829,8 @@
              xn = kp_biquad_run(xn, &bank->eq10[b], &g_eq10St[ch][b]);
          }
      }
@@ -30,7 +31,7 @@ diff --git a/KakaVoicePro.m b/KakaVoicePro.m
      if (g_compEnabled) {
          xn = kp_comp_sample(xn, ch);
      }
-@@ -2074,18 +2074,9 @@
+@@ -2082,24 +2081,9 @@
              float L = fbuf[f * chs] * (1.0f / 32768.0f);
              float R = (chs >= 2) ? (fbuf[f * chs + 1] * (1.0f / 32768.0f)) : L;
  
@@ -55,10 +56,11 @@ diff --git a/KakaVoicePro.m b/KakaVoicePro.m
 +            // v30.0：删除 Suya 延迟声场（ch=1 单声道做 7ms/13ms 延迟叠加，
 +            // 会与直达声形成梳状滤波：金属空洞感 + 多人麦极易发糊、被误判回声）
 +            // v30.0：删除 bassLANE 低频归中（全链路单声道采集，低频本来就无左右可分）
- 
              if (isPrimary && g_reverbEnabled) {
-                 float lw = kp_reverb_tick(L * 32768.0f, 0) * (1.0f / 32768.0f);
-@@ -2834,9 +2825,10 @@
+                 float wL = kp_reverb_tick(L * 32768.0f, 0) * (1.0f / 32768.0f);
+                 float wR = (chs >= 2) ? (kp_reverb_tick(R * 32768.0f, 1) * (1.0f / 32768.0f)) : wL;
+@@ -2824,9 +2808,11 @@
+         g_limiterEnabled   = YES;
          g_limiterCeiling   = 31100.0f; // 约 -0.5dBFS，留 0.5dB 余量杜绝方波
          g_makeupGain       = 2.1f;     // 黄金增益，配合 RMS 护栏保动态
 -        g_tubeEnabled      = YES;
@@ -72,7 +74,7 @@ diff --git a/KakaVoicePro.m b/KakaVoicePro.m
  
          // 远端护盾：把别人声音压低到 20%，避免外放/耳返回声抑制
          g_shieldRemote     = YES;
-@@ -2941,7 +2941,7 @@
+@@ -2941,7 +2927,7 @@
      UIColor *sec = [UIColor colorWithRed:0.30 green:0.78 blue:0.50 alpha:1.0];
      CGFloat y = 2;
  
@@ -81,8 +83,8 @@ diff --git a/KakaVoicePro.m b/KakaVoicePro.m
      y += 20;
  
      // ---- 一键霸麦锁定（置顶，进房前先开） ----
-@@ -2982,30 +2982,6 @@
-     })];
+@@ -2992,24 +2978,8 @@
+                            [UIColor colorWithWhite:0.50 alpha:1.0], NO)];
      y += 18;
  
 -    // ---- 第 4 级 Suya 立体声扩展 ----
@@ -101,17 +103,18 @@ diff --git a/KakaVoicePro.m b/KakaVoicePro.m
 -    })];
 -    y += 34;
 -
-     // ---- 第 5 级 限制器 ----
+-    // ---- 第 5 级 限制器 ----
 -    kp_row_switch(c, y, w, @"5 · 限制器 3.1", g_limiterEnabled, ^(BOOL on) {
 +    // ---- 第 4 级 限制器（唯一让你既大又不破音的模块） ----
 +    kp_row_switch(c, y, w, @"4 · 限制器 3.1（前瞻砖墙）", g_limiterEnabled, ^(BOOL on) {
          g_limiterEnabled = on;
          save_current_settings();
      });
-@@ -3016,37 +2992,6 @@
+@@ -3022,47 +2992,6 @@
+         save_current_settings();
      })];
      y += 34;
- 
+-
 -    // ---- 第 6 级 bassLANE ----
 -    kp_row_switch(c, y, w, @"6 · bassLANE 低频归中", g_bassLaneEnabled, ^(BOOL on) {
 -        g_bassLaneEnabled = on;
@@ -152,7 +155,6 @@ diff --git a/KakaVoicePro.m b/KakaVoicePro.m
 -        save_current_settings();
 -    })];
 -    y += 36;
--
+ 
      // ---- 话放 / 总线 / 传输 ----
      [c addSubview:kp_label(CGRectMake(16, y, w - 32, 16), @"话放 / 总线 / 传输", 10, sec, YES)];
-     y += 20;
