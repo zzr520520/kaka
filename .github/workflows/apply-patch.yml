@@ -1,0 +1,53 @@
+name: Apply Source Patch
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/patches/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply patches
+        run: |
+          set -euo pipefail
+          ls -l .github/patches/
+          git apply --check --verbose .github/patches/*.patch
+          git apply --verbose .github/patches/*.patch
+          rm -f .github/patches/*.patch
+          echo '--- verify ---'
+          grep -n 'KP_VERSION' KakaVoicePro.m | head -3
+          grep -n 'kp_toggle_master_lock' KakaVoicePro.m
+          git diff --stat
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          git config user.name "kaka-patch-bot"
+          git config user.email "kaka-patch-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: v29.9 一键霸麦锁定 + 双总线混音 + 侧链地板 0.20"
+          git push origin HEAD:main
+
+      - name: Dispatch build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/dispatches" \
+            -d '{"ref":"main"}'
