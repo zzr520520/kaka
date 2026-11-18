@@ -101,7 +101,7 @@ static _Atomic long g_mixCalls  = 0;
 static _Atomic long g_frames    = 0;
 static _Atomic int  g_hookState = 0;
 
-#define KP_VERSION @"v30.8"
+#define KP_VERSION @"v30.9"
 #define HPF_ALPHA_80HZ 0.9896f
 #define MAX_CHANNELS   8
 #define REVERB_CH      2
@@ -2547,13 +2547,16 @@ static CGFloat        g_vuTrackW  = 84.0;
 
 #define KP_PANEL_W  300.0f
 #define KP_PANEL_H  502.0f
-#define KP_PAGE_Y    92.0f
-#define KP_PAGE_H   380.0f
+#define KP_PAGE_Y   116.0f
+#define KP_PAGE_H   356.0f
 static UILabel       *g_statLabel = nil;
 static UILabel       *g_bgmLabel = nil;
 static UISwitch      *g_bgmSwitch = nil;
 // v30.7：顶部霸麦改为 UIButton（UISwitch 在自建 UIWindow 上易手势卡死/连发）
 static UIButton      *g_topLockBtn = nil;
+// v30.9：面板顶部 BGM / 说话闪避快捷开关（房间里随手控，不用翻“音效”页）
+static UISwitch      *g_topBgmSw   = nil;
+static UISwitch      *g_topDuckSw  = nil;
 
 static void kp_lock_btn_refresh(void) {
     if (!g_topLockBtn) return;
@@ -2567,7 +2570,9 @@ static void kp_lock_btn_refresh(void) {
 
 static void kp_sync_quick_sw(void) {
     kp_lock_btn_refresh();
-    if (g_bgmSwitch) g_bgmSwitch.on = (g_bgmOn != 0);
+    if (g_topBgmSw)   g_topBgmSw.on  = (g_bgmOn != 0);
+    if (g_topDuckSw)  g_topDuckSw.on = (g_duckEnabled != 0);
+    if (g_bgmSwitch)  g_bgmSwitch.on = (g_bgmOn != 0);
 }
 static UILabel       *g_clipStat = nil;
 static UIButton      *g_recBtn = nil;
@@ -3417,6 +3422,7 @@ static void kp_build_sound_page(CGFloat w) {
             return;
         }
         g_bgmOn = on ? 1 : 0;
+        kp_sync_quick_sw();   // v30.9：与顶部快捷 BGM 开关双向同步
     });
     [g_pageSound addSubview:g_bgmSwitch];
 
@@ -3464,6 +3470,7 @@ static void kp_build_sound_page(CGFloat w) {
     [g_pageSound addSubview:kp_switch(CGRectMake(w - 62, 242, 50, 22), g_duckEnabled, ^(BOOL on) {
         g_duckEnabled = on;
         save_current_settings();
+        kp_sync_quick_sw();   // v30.9：与顶部快捷闪避开关双向同步
     })];
 
     UILabel *bgmVolText = kp_label(CGRectMake(16, 276, 260, 16),
@@ -3763,6 +3770,33 @@ static void kp_build_panel(void) {
     }] forControlEvents:UIControlEventTouchUpInside];
     [g_panel addSubview:lockBtn];
 
+    // v30.9：BGM / 说话闪避 快捷行——房间内随手开关，与“音效”页双向同步
+    UIColor *qfg = [UIColor colorWithWhite:0.72 alpha:1.0];
+    [g_panel addSubview:kp_label(CGRectMake(16, 95, 66, 18), @"🎵 BGM", 10, qfg, YES)];
+    g_topBgmSw = kp_switch(CGRectMake(78, 92, 46, 22), (g_bgmOn != 0), ^(BOOL on) {
+        if (on && g_bgmLen == 0) {
+            NSArray<NSString *> *files = kp_bgm_files();
+            NSString *pick = nil;
+            if (g_bgmName.length && [files containsObject:g_bgmName]) pick = g_bgmName;
+            else pick = files.firstObject;
+            if (pick) { kp_bgm_load_name(pick); return; }
+            g_bgmOn = 0;
+            kp_sync_quick_sw();
+            [g_win kp_show_toast:@"还没有伴奏，先点导入"];
+            return;
+        }
+        g_bgmOn = on ? 1 : 0;
+        kp_sync_quick_sw();
+    });
+    [g_panel addSubview:g_topBgmSw];
+
+    [g_panel addSubview:kp_label(CGRectMake(150, 95, 70, 18), @"说话闪避", 10, qfg, NO)];
+    g_topDuckSw = kp_switch(CGRectMake(w - 62, 92, 46, 22), (g_duckEnabled != 0), ^(BOOL on) {
+        g_duckEnabled = on;
+        save_current_settings();
+    });
+    [g_panel addSubview:g_topDuckSw];
+
     kp_build_rack_page(w);
     kp_build_eq_page(w);
     kp_build_voice_page(w);
@@ -3989,14 +4023,11 @@ static void kp_disable_agc(void) {
     }
 }
 
-// ---------- SDP 劫持 v30.8：单声道 128k VBR + FEC（服从网关规范，杜绝多人房重连踢出） ----------
+// ---------- SDP 劫持 v30.9：只锁单声道/采样率/防吞字/抗丢包，码率与带宽完全顺应服务端 ----------
 static id (*kp_orig_init_sdp)(id, SEL, NSInteger, NSString *) = NULL;
 
 static NSString *kp_sdp_patch(NSString *sdp) {
     if (![sdp containsString:@"opus/48000"]) return sdp;
-
-    NSInteger opusBr = g_opusBitrateBps;
-    if (opusBr != 192000 && opusBr != 256000 && opusBr != 320000 && opusBr != 510000) opusBr = 320000;
 
     NSString *sep = [sdp containsString:@"\r\n"] ? @"\r\n" : @"\n";
     NSMutableArray<NSString *> *lines = [[sdp componentsSeparatedByString:sep] mutableCopy];
@@ -4032,21 +4063,19 @@ static NSString *kp_sdp_patch(NSString *sdp) {
             NSString *t = [kv stringByTrimmingCharactersInSet:
                            [NSCharacterSet whitespaceCharacterSet]];
             if (t.length == 0) continue;
-            if ([t hasPrefix:@"maxaveragebitrate="] || [t hasPrefix:@"stereo="] ||
-                [t hasPrefix:@"sprop-stereo="]     || [t hasPrefix:@"cbr="] ||
+            // v30.9：maxaveragebitrate= / cbr= 不再剥离也不再重写——服务端下发什么就透传什么，
+            // 彻底顺从多人房 party_audio_quality_policy 的带宽分配，网关不再打回重协商
+            if ([t hasPrefix:@"stereo="]           ||
+                [t hasPrefix:@"sprop-stereo="]     ||
                 [t hasPrefix:@"usedtx="]           || [t hasPrefix:@"useinbandfec="] ||
                 [t hasPrefix:@"maxplaybackrate="]  || [t hasPrefix:@"sprop-maxcapturerate="]) continue;
             [keep addObject:t];
         }
+        // v30.9：只锁单声道 + 48k 采样 + 防吞字 + 抗丢包；码率/cbr/带宽完全交给服务端
         [keep addObject:@"stereo=0"];
         [keep addObject:@"sprop-stereo=0"];
-        // v30.8：单声道 128k 封顶——所有码率集中在一个声道，解析力反超双声道 192k（每声道仅 96k）；
-        // stereo=0;cbr=0 服从多人房 party_audio_quality_policy，网关不再因“拒绝降级”踢轨重连
-        NSInteger safeBr = (opusBr > 128000) ? 128000 : opusBr;
-        [keep addObject:[NSString stringWithFormat:@"maxaveragebitrate=%ld", (long)safeBr]];
         [keep addObject:@"maxplaybackrate=48000"];
         [keep addObject:@"sprop-maxcapturerate=48000"];
-        [keep addObject:@"cbr=0"];           // VBR：多人房网关正常接收，不触发带宽风控
         [keep addObject:@"usedtx=0"];        // 保持不静音断流
         [keep addObject:@"useinbandfec=1"];  // 带内前向纠错，多人拥挤也不卡顿
         lines[i] = [NSString stringWithFormat:@"%@ %@",
@@ -4056,21 +4085,18 @@ static NSString *kp_sdp_patch(NSString *sdp) {
         break;
     }
 
-    // 没有 fmtp 行就紧跟 rtpmap 补一条
+    // 没有 fmtp 行就紧跟 rtpmap 补一条（同样不写码率/cbr，顺应服务端）
     if (!hitFmtp && rtpmapIdx != NSNotFound) {
-        NSInteger safeBr = (opusBr > 128000) ? 128000 : opusBr;
         NSString *nf = [NSString stringWithFormat:
-                        @"%@ stereo=0;sprop-stereo=0;maxaveragebitrate=%ld;maxplaybackrate=48000;sprop-maxcapturerate=48000;cbr=0;usedtx=0;useinbandfec=1",
-                        fkey, (long)safeBr];
+                        @"%@ stereo=0;sprop-stereo=0;maxplaybackrate=48000;sprop-maxcapturerate=48000;usedtx=0;useinbandfec=1",
+                        fkey];
         [lines insertObject:nf atIndex:rtpmapIdx + 1];
         changed = YES;
     }
 
-    // v30.8：不再注入 b=AS / b=TIAS——完全顺应服务端原始 SDP 的带宽声明，
-    // 避免与多人房降级策略冲突触发风控重协商
+    // v30.8 起不再注入 b=AS / b=TIAS——完全顺应服务端原始 SDP 的带宽声明
     if (!changed) return sdp;
-    kp_log(@"SDP: opus pt=%@ -> mono %ldkbps VBR fec=1", pt,
-           (long)(((opusBr > 128000) ? 128000 : opusBr) / 1000));
+    kp_log(@"SDP: opus pt=%@ -> mono 48k dtx=0 fec=1（码率/带宽随服务端）", pt);
     return [lines componentsJoinedByString:sep];
 }
 
@@ -4120,12 +4146,9 @@ static void kp_lock_send_params(id params) {
     @try { encs = [params valueForKey:@"encodings"]; } @catch (NSException *e) { return; }
     if (![encs isKindOfClass:[NSArray class]]) return;
 
-    // v30.8：sender 层同样 cap 128k，与 SDP fmtp 的 maxaveragebitrate=128000 对齐，
-    // 避免上层参数与网关多人房降级策略冲突
-    int brVal = (g_opusBitrateBps > 128000) ? 128000 : g_opusBitrateBps;
-    NSNumber *br = @(brVal);
+    // v30.9：只保留高网络优先级，不再强锁 maxBitrateBps——码率交给 SDP/服务端协商分配，
+    // 避免与多人房带宽策略冲突触发拥塞踢出与重协商循环
     for (id enc in encs) {
-        @try { [enc setValue:br forKey:@"maxBitrateBps"]; } @catch (NSException *e) {}
         @try { [enc setValue:@(4) forKey:@"networkPriority"]; } @catch (NSException *e) {}
         @try { [enc setValue:@(1) forKey:@"priority"]; } @catch (NSException *e) {}
     }
