@@ -3,6 +3,9 @@ name: Build KakaVoicePro
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - '.github/**'
+      - 'README.txt'
   workflow_dispatch:
 
 permissions:
@@ -11,48 +14,53 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    env:
-      THEOS: /Users/runner/theos
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check source present
+      - name: Prepare iOS SDK
         run: |
+          set -euo pipefail
           ls -la
-          test -f KakaVoicePro.m || { echo "::error::缺少 KakaVoicePro.m，无法编译"; exit 1; }
-
-      - name: Setup Theos
-        run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          test -f KakaVoicePro.m || { echo "::error::缺少 KakaVoicePro.m"; exit 1; }
           git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
-          mkdir -p "$THEOS/sdks"
-          cp -R /tmp/sdks/iPhoneOS*.sdk "$THEOS/sdks/"
-          echo "$THEOS/bin" >> "$GITHUB_PATH"
-          ls -1 "$THEOS/sdks"
+          SDK=$(ls -d /tmp/sdks/iPhoneOS*.sdk | sort -V | tail -1)
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+          echo "using sdk: $SDK"
 
-      - name: Install ldid
-        run: |
-          brew install ldid || brew install dpkg || true
-          which ldid || echo "ldid still missing"
-
-      - name: Build
+      - name: Build (clang 交叉编译，对应 build.sh)
         id: build
         continue-on-error: true
         run: |
           set -o pipefail
-          make -j"$(sysctl -n hw.ncpu)" 2>&1 | tee "$RUNNER_TEMP/build.log"
+          clang -target arm64-apple-ios14.0 \
+            -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 -I. \
+            -o KakaVoicePro_v29.8.dylib \
+            KakaVoicePro.m tweetnacl.c fishhook.c \
+            -framework UIKit \
+            -framework Foundation \
+            -framework AudioToolbox \
+            -framework Security \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -Wl,-arch,arm64 \
+            -Wl,-platform_version,ios,14.0,15.6 \
+            2>&1 | tee "$RUNNER_TEMP/build.log"
 
-      - name: Show output
+      - name: Inspect output
         if: always()
-        run: find .theos/obj -name '*.dylib' -exec file {} \; || true
+        run: |
+          ls -l *.dylib || true
+          file *.dylib || true
+          shasum -a 256 *.dylib || true
 
       - name: Upload dylib
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: KakaVoicePro-dylib
-          path: .theos/obj/**/*.dylib
+          path: KakaVoicePro_v29.8.dylib
 
       - name: Publish build log
         if: steps.build.outcome == 'failure'
@@ -63,7 +71,7 @@ jobs:
           git checkout -B ci-logs
           cp "$RUNNER_TEMP/build.log" build.log
           git add -f build.log
-          git commit -m "ci: build log (run ${{ github.run_number }}) [skip ci]"
+          git commit -m "ci: build log (run ${{ github.run_number }})"
           git push -f origin ci-logs
 
       - name: Fail on build error
