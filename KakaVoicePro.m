@@ -101,7 +101,7 @@ static _Atomic long g_mixCalls  = 0;
 static _Atomic long g_frames    = 0;
 static _Atomic int  g_hookState = 0;
 
-#define KP_VERSION @"v30.6"
+#define KP_VERSION @"v30.7"
 #define HPF_ALPHA_80HZ 0.9896f
 #define MAX_CHANNELS   8
 #define REVERB_CH      2
@@ -1898,6 +1898,41 @@ static void kp_lic_refresh_bar(void) {
 
 static UIWindow *g_licWin = nil;
 
+// v30.7：穿透型授权窗口——没有弹窗在展示时 hitTest 返回 nil，
+// 防止全屏半透明窗口把悬浮球/开关/底层 App 的触摸全部吃掉（“点不动”的直接原因）
+static UIView *(*g_licSuperHitTest)(id, SEL, CGPoint, UIEvent *) = NULL;
+
+static void kp_lic_window_class_once(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        SEL htSel = @selector(hitTest:withEvent:);
+        Method superM = class_getInstanceMethod([UIWindow class], htSel);
+        if (!superM) return;
+        g_licSuperHitTest = (UIView *(*)(id, SEL, CGPoint, UIEvent *))method_getImplementation(superM);
+
+        Class cls = objc_allocateClassPair([UIWindow class], "KPLicWindow", 0);
+        if (!cls) return;
+        class_addMethod(cls, htSel, imp_implementationWithBlock(^(id _s, CGPoint point, UIEvent *event) {
+            UIViewController *host = [(UIWindow *)_s rootViewController];
+            // 有弹窗在展示/动画中才接收触摸；否则一律穿透到下层悬浮窗与 App
+            if (host.presentedViewController) {
+                return g_licSuperHitTest(_s, htSel, point, event);
+            }
+            return (UIView *)nil;
+        }), nil);
+        objc_registerClassPair(cls);
+    });
+}
+
+// 取弹窗链最顶层的 VC：避免“已在展示中再 present”的竞态把弹窗链打断、留下裸窗口
+static UIViewController *kp_lic_top_vc(UIViewController *base) {
+    UIViewController *top = base;
+    while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) {
+        top = top.presentedViewController;
+    }
+    return top;
+}
+
 static UIAlertController *kp_lic_build_alert(void) {
     NSString *state = g_licOk
         ? [NSString stringWithFormat:@"已授权，到期 %@", g_licExpireStr]
@@ -1928,10 +1963,11 @@ static UIAlertController *kp_lic_build_alert(void) {
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [tip addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault
                                              handler:^(UIAlertAction *b) {
+            if (!g_licWin) return;
             UIAlertController *again = kp_lic_build_alert();
-            [g_licWin.rootViewController presentViewController:again animated:YES completion:nil];
+            [kp_lic_top_vc(g_licWin.rootViewController) presentViewController:again animated:YES completion:nil];
         }]];
-        [g_licWin.rootViewController presentViewController:tip animated:YES completion:nil];
+        [kp_lic_top_vc(g_licWin.rootViewController) presentViewController:tip animated:YES completion:nil];
     }]];
 
     [al addAction:[UIAlertAction actionWithTitle:@"立即激活" style:UIAlertActionStyleDefault
@@ -1944,28 +1980,43 @@ static UIAlertController *kp_lic_build_alert(void) {
                                                            preferredStyle:UIAlertControllerStyleAlert];
         [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault
                                            handler:^(UIAlertAction *b) {
-            if (ok) {
+            if (ok && g_licWin) {
                 g_licWin.hidden = YES;
                 g_licWin = nil;
                 kp_lic_refresh_bar();
             }
         }]];
-        [g_licWin.rootViewController presentViewController:r animated:YES completion:nil];
+        [kp_lic_top_vc(g_licWin.rootViewController) presentViewController:r animated:YES completion:nil];
     }]];
 
     [al addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel
                                         handler:^(UIAlertAction *a) {
         g_licWin.hidden = YES;
         g_licWin = nil;
+        kp_lic_refresh_bar();
     }]];
     return al;
 }
 
 static void kp_lic_show_alert(void) {
-    if (g_licWin) return;
+    kp_lic_window_class_once();
+
+    if (g_licWin) {
+        // v30.7 卡死自愈：窗口还在但没有任何弹窗在展示（上次弹窗链被打断），
+        // 先彻底销毁再重建；有弹窗在展示则本次忽略
+        if (!g_licWin.rootViewController.presentedViewController) {
+            kp_log(@"LIC: 检测到残留授权窗口（无弹窗），销毁重建");
+            g_licWin.hidden = YES;
+            g_licWin = nil;
+        } else {
+            return;
+        }
+    }
 
     CGRect scr = [UIScreen mainScreen].bounds;
-    g_licWin = [[UIWindow alloc] initWithFrame:scr];
+    Class wcls = NSClassFromString(@"KPLicWindow");
+    if (!wcls) wcls = [UIWindow class];
+    g_licWin = [[wcls alloc] initWithFrame:scr];
     g_licWin.windowLevel = UIWindowLevelAlert + 200;
     g_licWin.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
 
@@ -2200,8 +2251,6 @@ static BOOL (*orig_speakerAEC)(id, SEL) = NULL;
 static void (*orig_setSpeakerAEC)(id, SEL, BOOL) = NULL;
 static void (*orig_stopRecording)(id, SEL) = NULL;
 static void (*orig_speechActivity)(id, SEL, id, NSInteger) = NULL;   // v30.6：多人说话活跃度事件
-static void (*orig_disableSystemEcho)(id, SEL) = NULL;               // v30.6：原生系统回声抑制关闭
-static id    g_kpLastAudioDev = nil;                                 // v30.6：最近出现的采集设备实例
 
 static BOOL kp_hook_capture_gate(id self, SEL _cmd) {
     if (g_dspEnabled || g_priorityLoud) return NO;
@@ -2301,17 +2350,9 @@ static int kp_install_hooks(void) {
             method_setImplementation(mStop, (IMP)kp_hook_stop_recording);
         }
 
-        // v30.6：捕获设备实例并放行 disableSystemEcho；霸麦锁定时会主动调它关系统回声
-        Method mDisEcho = class_getInstanceMethod(dev, NSSelectorFromString(@"disableSystemEcho"));
-        if (mDisEcho && !orig_disableSystemEcho) {
-            SEL disEchoSel = NSSelectorFromString(@"disableSystemEcho");
-            orig_disableSystemEcho = (void (*)(id, SEL))method_getImplementation(mDisEcho);
-            method_setImplementation(mDisEcho, imp_implementationWithBlock(^(id _s) {
-                g_kpLastAudioDev = _s;
-                if (orig_disableSystemEcho) orig_disableSystemEcho(_s, disEchoSel);
-            }));
-            kp_log(@"[anticut] hook disableSystemEcho 成功！");
-        }
+        // v30.7：不再 Hook/调用 disableSystemEcho —— 它是路由切换/会话销毁时的底层硬件清理方法，
+        // 录音期间外部强调会打断 AVAudioEngine/VoiceProcessingIO 导致停麦。
+        // 系统回声抑制已在 kp_disable_agc + kp_hook_speaker_aec 安全关闭。
     }
     Class mixer = objc_getClass("KakaAudioMixer");
     if (mixer) {
@@ -2526,11 +2567,21 @@ static CGFloat        g_vuTrackW  = 84.0;
 static UILabel       *g_statLabel = nil;
 static UILabel       *g_bgmLabel = nil;
 static UISwitch      *g_bgmSwitch = nil;
-// v30.6：面板顶部快捷开关（VU 正下方，房间里不用翻页）；霸麦走 0.35s 防抖
-static UISwitch      *g_topLockSw = nil;
+// v30.7：顶部霸麦改为 UIButton（UISwitch 在自建 UIWindow 上易手势卡死/连发）
+static UIButton      *g_topLockBtn = nil;
+
+static void kp_lock_btn_refresh(void) {
+    if (!g_topLockBtn) return;
+    BOOL on = (g_oneTapMasterLock != 0);
+    [g_topLockBtn setTitle:on ? @"🔒 霸麦锁定中（点击解除）" : @"🔓 点击开启一键霸麦锁定"
+                  forState:UIControlStateNormal];
+    g_topLockBtn.backgroundColor = on
+        ? [UIColor colorWithRed:0.15 green:0.62 blue:0.35 alpha:1.0]
+        : [UIColor colorWithWhite:0.22 alpha:1.0];
+}
 
 static void kp_sync_quick_sw(void) {
-    if (g_topLockSw) g_topLockSw.on = (g_oneTapMasterLock != 0);
+    kp_lock_btn_refresh();
     if (g_bgmSwitch) g_bgmSwitch.on = (g_bgmOn != 0);
 }
 static UILabel       *g_clipStat = nil;
@@ -2865,14 +2916,8 @@ static void kp_toggle_master_lock(BOOL lock) {
         }
         kp_rebuild_filter_bank();
 
-        // v30.6：主动调用一次原生 disableSystemEcho，锁定期间系统回声抑制彻底关闭
-        SEL disEchoSel = NSSelectorFromString(@"disableSystemEcho");
-        id devInst = g_kpLastAudioDev;
-        if (devInst && [devInst respondsToSelector:disEchoSel]) {
-            ((void (*)(id, SEL))objc_msgSend)(devInst, disEchoSel);
-            kp_log(@"[MASTER-LOCK] 已调用原生 disableSystemEcho 关闭系统回声抑制");
-        }
-
+        // v30.7：不再调用原生 disableSystemEcho（曾导致音频引擎重启/停麦），
+        // 系统回声抑制由 kp_disable_agc + kp_hook_speaker_aec 在安全层关闭。
         kp_log(@"[MASTER-LOCK] 一键霸麦已锁定：防削波电平+高穿透音色+192k并发档");
     } else {
         g_shieldRemote = NO;
@@ -2881,6 +2926,7 @@ static void kp_toggle_master_lock(BOOL lock) {
     }
     save_current_settings();
     kp_update_ball();
+    kp_lock_btn_refresh();   // v30.7：任何入口切换锁定后同步顶部按钮文字/配色
 }
 
 static void kp_attach_scene(void);
@@ -3719,15 +3765,18 @@ static void kp_build_panel(void) {
     }] forControlEvents:UIControlEventTouchUpInside];
     [g_panel addSubview:close];
 
-    // v30.6：顶部只留一键霸麦锁定（走 kp_toggle_master_lock 0.35s 防抖，连点不横跳）
-    CGFloat qy = 62;
-    UIColor *qfg = [UIColor colorWithWhite:0.72 alpha:1.0];
-    [g_panel addSubview:kp_label(CGRectMake(16, qy + 3, w - 84, 16), @"🔒 一键霸麦锁定", 9, qfg, YES)];
-    g_topLockSw = kp_switch(CGRectMake(w - 62, qy, 46, 22), (g_oneTapMasterLock != 0), ^(BOOL on) {
-        kp_toggle_master_lock(on);
+    // v30.7：顶部霸麦锁定改用 UIButton——点击一次切换一次，在自建 UIWindow 上绝不连发/卡死
+    UIButton *lockBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    lockBtn.frame = CGRectMake(16, 62, w - 32, 24);
+    lockBtn.layer.cornerRadius = 6;
+    lockBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    g_topLockBtn = lockBtn;
+    kp_lock_btn_refresh();
+    [lockBtn addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
+        kp_toggle_master_lock(!(g_oneTapMasterLock != 0));
         kp_sync_quick_sw();
-    });
-    [g_panel addSubview:g_topLockSw];
+    }] forControlEvents:UIControlEventTouchUpInside];
+    [g_panel addSubview:lockBtn];
 
     kp_build_rack_page(w);
     kp_build_eq_page(w);
