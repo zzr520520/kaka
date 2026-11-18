@@ -1,0 +1,166 @@
+diff --git a/KakaVoicePro.m b/KakaVoicePro.m
+--- a/KakaVoicePro.m
++++ b/KakaVoicePro.m
+@@ -100,7 +100,7 @@
+ static _Atomic long g_frames    = 0;
+ static _Atomic int  g_hookState = 0;
+ 
+-#define KP_VERSION @"v30.1"
++#define KP_VERSION @"v30.2"
+ #define HPF_ALPHA_80HZ 0.9896f
+ #define MAX_CHANNELS   8
+ #define REVERB_CH      2
+@@ -714,21 +714,18 @@
+     g_compEnv[ch] += (absx - g_compEnv[ch]) * coef;
+     float env = g_compEnv[ch];
+ 
+-    // 1) 向上提拉：0.012→0.025 之间线性渐入，0.025 以上满额补粗
+-    //    低于 0.012 不提拉（避免抬底噪）；原始峰值已接近满幅时也不再叠乘（避免死电方波）
+-    //    强声霸麦把上限从 3.2 提到 5.0，纯人声底子直接拉起来
++    // 1) 向上提拉（v30.2 修正）：0.045→0.080 之间线性渐入，0.080 以上满额
++    //    低于 0.045（4.5%）一律不提拉 —— 原来门槛 0.012 会把 7% 的底噪放大到 95%，
++    //    一开大增益就是“人声和底噪一起糊”。最大提拉从 5.0 压到 1.85，彻底杜绝发糊
+     float upGain = 1.0f;
+     float thr = g_compThresh;
+-    if (absx < 0.5f && env > 0.012f && env < thr && thr > 0.001f) {
+-        float maxUp = g_priorityLoud ? 5.0f : 3.2f;
+-        float base = powf(thr / env, 0.55f);
++    if (absx < 0.55f && env > 0.045f && env < thr && thr > 0.001f) {
++        float maxUp = g_priorityLoud ? 1.85f : 1.50f;
++        float base = powf(thr / env, 0.45f);
+         if (base > maxUp) base = maxUp;
+-        float ramp = 1.0f;
+-        if (env < 0.025f) {
+-            ramp = (env - 0.012f) / 0.013f;
+-            if (ramp < 0.0f) ramp = 0.0f;
+-            if (ramp > 1.0f) ramp = 1.0f;
+-        }
++        float ramp = (env - 0.045f) / 0.035f;
++        if (ramp < 0.0f) ramp = 0.0f;
++        if (ramp > 1.0f) ramp = 1.0f;
+         upGain = 1.0f + (base - 1.0f) * ramp;
+     }
+ 
+@@ -2158,14 +2155,14 @@
+         if (isPrimary && rmsCnt > 0) {
+             float rms = sqrtf(sumSq / (float)rmsCnt);
+             if (rms > 0.0001f) {
+-                // 强声霸麦目标 -8dBFS（0.40），普通模式 -9dBFS（0.355）
+-                // 峰值锁在 0.99，-8dBFS 相当于保留约 8dB 波峰因数，再往上就会重新逼近方波
+-                float tgt = g_priorityLoud ? 0.400f : 0.355f;
++                // v30.2：霸麦目标 -10.5dBFS（0.300），普通 -11dBFS（0.280）
++                // 比原来 -8dBFS 多留 2.5dB 波峰余量，网关不会把这条流判成持续噪音
++                float tgt = g_priorityLoud ? 0.300f : 0.280f;
+                 float want = tgt / rms;
+                 if (want > 1.0f) want = 1.0f;
+-                float coef = (want < g_rmsTrim) ? 0.10f : 0.004f;
++                float coef = (want < g_rmsTrim) ? 0.12f : 0.005f;
+                 g_rmsTrim += (want - g_rmsTrim) * coef;
+-                if (g_rmsTrim < 0.22f) g_rmsTrim = 0.22f;
++                if (g_rmsTrim < 0.20f) g_rmsTrim = 0.20f;
+                 if (g_rmsTrim > 1.0f)  g_rmsTrim = 1.0f;
+             }
+             sumSq = 0.0f;
+@@ -2488,12 +2485,23 @@
+ static CGFloat        g_vuTrackW  = 84.0;
+ 
+ #define KP_PANEL_W  300.0f
+-#define KP_PANEL_H  470.0f
+-#define KP_PAGE_Y    74.0f
+-#define KP_PAGE_H   374.0f
++#define KP_PANEL_H  502.0f
++#define KP_PAGE_Y   106.0f
++#define KP_PAGE_H   370.0f
+ static UILabel       *g_statLabel = nil;
+ static UILabel       *g_bgmLabel = nil;
+ static UISwitch      *g_bgmSwitch = nil;
++// v30.2：面板顶部快捷三件套（VU 正下方，房间里不用翻页）
++static UISwitch      *g_topLockSw = nil;
++static UISwitch      *g_topBgmSw  = nil;
++static UISwitch      *g_topDuckSw = nil;
++
++static void kp_sync_quick_sw(void) {
++    if (g_topLockSw) g_topLockSw.on = (g_oneTapMasterLock != 0);
++    if (g_topBgmSw)  g_topBgmSw.on  = (g_bgmOn != 0);
++    if (g_topDuckSw) g_topDuckSw.on = (g_duckEnabled != 0);
++    if (g_bgmSwitch) g_bgmSwitch.on = (g_bgmOn != 0);
++}
+ static UILabel       *g_clipStat = nil;
+ static UIButton      *g_recBtn = nil;
+ static UISwitch      *g_clipLoopSw = nil;
+@@ -2559,7 +2567,7 @@
+             g_bgmName = name;
+             [[NSUserDefaults standardUserDefaults] setObject:name forKey:KEY_BGM_NAME];
+             g_bgmOn = 1;
+-            if (g_bgmSwitch) g_bgmSwitch.on = YES;
++            kp_sync_quick_sw();
+             kp_log(@"bgm load %@ (%.1fs)", name, (double)n / 48000.0);
+         });
+     });
+@@ -2570,7 +2578,7 @@
+     if (!name.length) return;
+     if (g_bgmName && [g_bgmName isEqualToString:name]) {
+         kp_delete_bgm();
+-        if (g_bgmSwitch) g_bgmSwitch.on = NO;
++        kp_sync_quick_sw();
+     }
+     [[NSFileManager defaultManager] removeItemAtPath:kp_bgm_path(name) error:nil];
+     kp_log(@"bgm deleted: %@", name);
+@@ -2789,12 +2797,12 @@
+         g_gateEnabled      = NO;      // 多人抢麦时避免吞字
+         g_throatEnabled    = YES;
+         g_compEnabled      = YES;
+-        g_compThresh       = 0.22f;
+-        g_compRatio        = 4.5f;
++        g_compThresh       = 0.32f;   // v30.2：门限抬高，底噪不参与提拉
++        g_compRatio        = 3.2f;    // 适度压缩，保留说话节奏
+         g_eq10Enabled      = YES;
+         g_limiterEnabled   = YES;
+-        g_limiterCeiling   = 31100.0f; // 约 -0.5dBFS，留 0.5dB 余量杜绝方波
+-        g_makeupGain       = 2.1f;     // 黄金增益，配合 RMS 护栏保动态
++        g_limiterCeiling   = 30800.0f; // v30.2：留 6% 余量，[mixproc] 峰值绝不撞 100%
++        g_makeupGain       = 1.45f;    // v30.2：黄金总增益，配合双峰提亮不过载
+         // v30.0：这三项在精简链路里已不参与处理，锁定态一并置 NO
+         g_imagerEnabled    = NO;       // 关 Suya 声场，规避梳状滤波
+         g_haasEnabled      = NO;
+@@ -3667,6 +3675,40 @@
+     }] forControlEvents:UIControlEventTouchUpInside];
+     [g_panel addSubview:close];
+ 
++    // v30.2：快捷三件套（VU 正下方）：一键霸麦锁定 / BGM 开关 / 说话闪避
++    CGFloat qy = 62, qW = 86;
++    UIColor *qfg = [UIColor colorWithWhite:0.72 alpha:1.0];
++    [g_panel addSubview:kp_label(CGRectMake(16, qy, qW, 11), @"🔒 霸麦锁定", 9, qfg, YES)];
++    g_topLockSw = kp_switch(CGRectMake(16, qy + 13, 46, 22), (g_oneTapMasterLock != 0), ^(BOOL on) {
++        kp_toggle_master_lock(on);
++        kp_sync_quick_sw();
++    });
++    [g_panel addSubview:g_topLockSw];
++
++    [g_panel addSubview:kp_label(CGRectMake(16 + qW + 2, qy, qW, 11), @"🎵 BGM", 9, qfg, YES)];
++    g_topBgmSw = kp_switch(CGRectMake(16 + qW + 2, qy + 13, 46, 22), (g_bgmOn != 0), ^(BOOL on) {
++        if (on && g_bgmLen == 0) {
++            NSArray<NSString *> *files = kp_bgm_files();
++            NSString *pick = nil;
++            if (g_bgmName.length && [files containsObject:g_bgmName]) pick = g_bgmName;
++            else pick = files.firstObject;
++            if (pick) { kp_bgm_load_name(pick); kp_sync_quick_sw(); return; }
++            [g_win kp_show_toast:@"还没有伴奏，先点导入"];
++        } else {
++            g_bgmOn = on ? 1 : 0;
++        }
++        kp_sync_quick_sw();
++    });
++    [g_panel addSubview:g_topBgmSw];
++
++    [g_panel addSubview:kp_label(CGRectMake(16 + 2 * (qW + 2), qy, qW, 11), @"⚡ 说话闪避", 9, qfg, YES)];
++    g_topDuckSw = kp_switch(CGRectMake(16 + 2 * (qW + 2), qy + 13, 46, 22), (g_duckEnabled != 0), ^(BOOL on) {
++        g_duckEnabled = on;
++        save_current_settings();
++        kp_sync_quick_sw();
++    });
++    [g_panel addSubview:g_topDuckSw];
++
+     kp_build_rack_page(w);
+     kp_build_eq_page(w);
+     kp_build_voice_page(w);
