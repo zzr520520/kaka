@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -20,10 +20,7 @@ jobs:
       - name: Check source present
         run: |
           ls -la
-          if [ ! -f KakaVoicePro.m ]; then
-            echo "::error::缺少 KakaVoicePro.m（Tweak.xm 顶部 #import \"KakaVoicePro.m\"），无法编译"
-            exit 1
-          fi
+          test -f KakaVoicePro.m || { echo "::error::缺少 KakaVoicePro.m，无法编译"; exit 1; }
 
       - name: Setup Theos
         run: |
@@ -40,15 +37,35 @@ jobs:
           which ldid || echo "ldid still missing"
 
       - name: Build
-        run: make -j"$(sysctl -n hw.ncpu)"
+        id: build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make -j"$(sysctl -n hw.ncpu)" 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       - name: Show output
         if: always()
         run: find .theos/obj -name '*.dylib' -exec file {} \; || true
 
       - name: Upload dylib
-        if: success()
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: KakaVoicePro-dylib
           path: .theos/obj/**/*.dylib
+
+      - name: Publish build log
+        if: steps.build.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          git config user.name "kaka-ci-bot"
+          git config user.email "kaka-ci-bot@users.noreply.github.com"
+          git checkout -B ci-logs
+          cp "$RUNNER_TEMP/build.log" build.log
+          git add -f build.log
+          git commit -m "ci: build log (run ${{ github.run_number }}) [skip ci]"
+          git push -f origin ci-logs
+
+      - name: Fail on build error
+        if: steps.build.outcome == 'failure'
+        run: exit 1
