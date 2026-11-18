@@ -101,7 +101,7 @@ static _Atomic long g_mixCalls  = 0;
 static _Atomic long g_frames    = 0;
 static _Atomic int  g_hookState = 0;
 
-#define KP_VERSION @"v30.7"
+#define KP_VERSION @"v30.8"
 #define HPF_ALPHA_80HZ 0.9896f
 #define MAX_CHANNELS   8
 #define REVERB_CH      2
@@ -2250,7 +2250,6 @@ static void (*orig_setCaptureGate)(id, SEL, BOOL) = NULL;
 static BOOL (*orig_speakerAEC)(id, SEL) = NULL;
 static void (*orig_setSpeakerAEC)(id, SEL, BOOL) = NULL;
 static void (*orig_stopRecording)(id, SEL) = NULL;
-static void (*orig_speechActivity)(id, SEL, id, NSInteger) = NULL;   // v30.6：多人说话活跃度事件
 
 static BOOL kp_hook_capture_gate(id self, SEL _cmd) {
     if (g_dspEnabled || g_priorityLoud) return NO;
@@ -2369,24 +2368,10 @@ static int kp_install_hooks(void) {
             method_setImplementation(me, (IMP)kp_hook_will_enable_engine);
         }
 
-        // v30.6：多人说话活跃度事件——霸麦/强声时屏蔽，防止原生混音器借“超过3人说话”压低/切断本地音轨
-        SEL actSel = NSSelectorFromString(@"audioDeviceModule:didReceiveSpeechActivityEvent:");
-        Method mAct = class_getInstanceMethod(mixer, actSel);
-        if (mAct && !orig_speechActivity) {
-            static NSInteger s_lastActEvent = -999;   // 只在事件类型变化时写日志，避免刷屏
-            orig_speechActivity = (void (*)(id, SEL, id, NSInteger))method_getImplementation(mAct);
-            method_setImplementation(mAct, imp_implementationWithBlock(^(id _s, id adm, NSInteger event) {
-                if (g_oneTapMasterLock || g_priorityLoud) {
-                    if (event != s_lastActEvent) {
-                        kp_log(@"[anticut] 屏蔽语音活跃事件 event=%ld（霸麦中，不让混音器让位）", (long)event);
-                        s_lastActEvent = event;
-                    }
-                    return;
-                }
-                if (orig_speechActivity) orig_speechActivity(_s, actSel, adm, event);
-            }));
-            kp_log(@"[anticut] hook didReceiveSpeechActivityEvent 成功！");
-        }
+        // v30.8：不再拦截 audioDeviceModule:didReceiveSpeechActivityEvent: ——
+        // 多人房切换麦位时原生层依赖该回调同步混音引擎状态，彻底吞掉会触发超时保护
+        // 主动 stopRecording 重建音频会话（日志中密集 stopRecording + SDP 重协商的元凶之一）。
+        // 防压制由既有链路保障：AGC/NS/AEC 已锁死关闭 + 输出电平 outPeak≈90% + BGM 同总线限幅。
     }
     kp_probe_selectors();
     return state;
@@ -2905,7 +2890,7 @@ static void kp_toggle_master_lock(BOOL lock) {
         kp_shield_apply();
 
         // v30.1：锁定不碰 BGM 开关与“说话闪避”开关，放不放歌你自己控
-        g_opusBitrateBps   = 192000; // 黄金并发档：放歌接近无损，多人房不被拥塞踢出
+        g_opusBitrateBps   = 192000; // SDP 层统一 cap 到 128k 单声道 VBR（v30.8），多人房不再被踢
 
         // 锁死 10 段曲线：削 120Hz 以下浑浊，2.5k/4.2k 提亮穿透
         static const float masterEq[EQ10_BANDS] = {
@@ -2918,7 +2903,7 @@ static void kp_toggle_master_lock(BOOL lock) {
 
         // v30.7：不再调用原生 disableSystemEcho（曾导致音频引擎重启/停麦），
         // 系统回声抑制由 kp_disable_agc + kp_hook_speaker_aec 在安全层关闭。
-        kp_log(@"[MASTER-LOCK] 一键霸麦已锁定：防削波电平+高穿透音色+192k并发档");
+        kp_log(@"[MASTER-LOCK] 一键霸麦已锁定：防削波电平+高穿透音色+128k单声道VBR并发档");
     } else {
         g_shieldRemote = NO;
         kp_shield_apply();
@@ -4004,7 +3989,7 @@ static void kp_disable_agc(void) {
     }
 }
 
-// ---------- SDP 劫持：把 opus 协商锁定到 192kbps / 立体声 / CBR ----------
+// ---------- SDP 劫持 v30.8：单声道 128k VBR + FEC（服从网关规范，杜绝多人房重连踢出） ----------
 static id (*kp_orig_init_sdp)(id, SEL, NSInteger, NSString *) = NULL;
 
 static NSString *kp_sdp_patch(NSString *sdp) {
@@ -4053,14 +4038,17 @@ static NSString *kp_sdp_patch(NSString *sdp) {
                 [t hasPrefix:@"maxplaybackrate="]  || [t hasPrefix:@"sprop-maxcapturerate="]) continue;
             [keep addObject:t];
         }
-        [keep addObject:@"stereo=1"];
-        [keep addObject:@"sprop-stereo=1"];
-        [keep addObject:[NSString stringWithFormat:@"maxaveragebitrate=%ld", (long)opusBr]];
+        [keep addObject:@"stereo=0"];
+        [keep addObject:@"sprop-stereo=0"];
+        // v30.8：单声道 128k 封顶——所有码率集中在一个声道，解析力反超双声道 192k（每声道仅 96k）；
+        // stereo=0;cbr=0 服从多人房 party_audio_quality_policy，网关不再因“拒绝降级”踢轨重连
+        NSInteger safeBr = (opusBr > 128000) ? 128000 : opusBr;
+        [keep addObject:[NSString stringWithFormat:@"maxaveragebitrate=%ld", (long)safeBr]];
         [keep addObject:@"maxplaybackrate=48000"];
         [keep addObject:@"sprop-maxcapturerate=48000"];
-        [keep addObject:@"cbr=1"];
-        [keep addObject:@"usedtx=0"];
-        [keep addObject:@"useinbandfec=1"];
+        [keep addObject:@"cbr=0"];           // VBR：多人房网关正常接收，不触发带宽风控
+        [keep addObject:@"usedtx=0"];        // 保持不静音断流
+        [keep addObject:@"useinbandfec=1"];  // 带内前向纠错，多人拥挤也不卡顿
         lines[i] = [NSString stringWithFormat:@"%@ %@",
                     fkey, [keep componentsJoinedByString:@";"]];
         hitFmtp = YES;
@@ -4070,37 +4058,19 @@ static NSString *kp_sdp_patch(NSString *sdp) {
 
     // 没有 fmtp 行就紧跟 rtpmap 补一条
     if (!hitFmtp && rtpmapIdx != NSNotFound) {
+        NSInteger safeBr = (opusBr > 128000) ? 128000 : opusBr;
         NSString *nf = [NSString stringWithFormat:
-                        @"%@ stereo=1;sprop-stereo=1;maxaveragebitrate=%ld;maxplaybackrate=48000;sprop-maxcapturerate=48000;cbr=1;usedtx=0;useinbandfec=1",
-                        fkey, (long)opusBr];
+                        @"%@ stereo=0;sprop-stereo=0;maxaveragebitrate=%ld;maxplaybackrate=48000;sprop-maxcapturerate=48000;cbr=0;usedtx=0;useinbandfec=1",
+                        fkey, (long)safeBr];
         [lines insertObject:nf atIndex:rtpmapIdx + 1];
         changed = YES;
     }
 
-    // ③ 在 m=audio 段补 b=AS / b=TIAS
-    // SDP 规定媒体段内顺序为 m= → i= → c= → b= → k= → a=，所以必须排在 c= 之后
-    for (NSUInteger i = 0; i < lines.count; i++) {
-        if (![lines[i] hasPrefix:@"m=audio"]) continue;
-        NSUInteger pos = i + 1;
-        BOOL hasB = NO;
-        for (NSUInteger j = i + 1; j < lines.count; j++) {
-            NSString *lj = lines[j];
-            if (lj.length == 0) continue;
-            if ([lj hasPrefix:@"m="]) break;
-            if ([lj hasPrefix:@"b="]) { hasB = YES; break; }
-            if ([lj hasPrefix:@"i="] || [lj hasPrefix:@"c="]) { pos = j + 1; continue; }
-            if ([lj hasPrefix:@"a="] || [lj hasPrefix:@"k="]) break;
-        }
-        if (!hasB) {
-            [lines insertObject:[NSString stringWithFormat:@"b=AS:%ld", (long)(opusBr / 1000)] atIndex:pos];
-            [lines insertObject:[NSString stringWithFormat:@"b=TIAS:%ld", (long)opusBr] atIndex:pos + 1];
-            changed = YES;
-        }
-        break;
-    }
-
+    // v30.8：不再注入 b=AS / b=TIAS——完全顺应服务端原始 SDP 的带宽声明，
+    // 避免与多人房降级策略冲突触发风控重协商
     if (!changed) return sdp;
-    kp_log(@"SDP: opus pt=%@ -> %ldkbps stereo cbr usedtx=0", pt, (long)(opusBr / 1000));
+    kp_log(@"SDP: opus pt=%@ -> mono %ldkbps VBR fec=1", pt,
+           (long)(((opusBr > 128000) ? 128000 : opusBr) / 1000));
     return [lines componentsJoinedByString:sep];
 }
 
@@ -4150,7 +4120,10 @@ static void kp_lock_send_params(id params) {
     @try { encs = [params valueForKey:@"encodings"]; } @catch (NSException *e) { return; }
     if (![encs isKindOfClass:[NSArray class]]) return;
 
-    NSNumber *br = @(g_opusBitrateBps);
+    // v30.8：sender 层同样 cap 128k，与 SDP fmtp 的 maxaveragebitrate=128000 对齐，
+    // 避免上层参数与网关多人房降级策略冲突
+    int brVal = (g_opusBitrateBps > 128000) ? 128000 : g_opusBitrateBps;
+    NSNumber *br = @(brVal);
     for (id enc in encs) {
         @try { [enc setValue:br forKey:@"maxBitrateBps"]; } @catch (NSException *e) {}
         @try { [enc setValue:@(4) forKey:@"networkPriority"]; } @catch (NSException *e) {}
