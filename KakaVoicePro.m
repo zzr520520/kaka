@@ -100,7 +100,7 @@ static _Atomic long g_mixCalls  = 0;
 static _Atomic long g_frames    = 0;
 static _Atomic int  g_hookState = 0;
 
-#define KP_VERSION @"v30.2"
+#define KP_VERSION @"v30.3"
 #define HPF_ALPHA_80HZ 0.9896f
 #define MAX_CHANNELS   8
 #define REVERB_CH      2
@@ -2925,11 +2925,7 @@ static void kp_build_rack_page(CGFloat w) {
     [c addSubview:kp_label(CGRectMake(16, y, w - 32, 16), @"4 级核心链（话放 → 母带）", 10, sec, YES)];
     y += 20;
 
-    // ---- 一键霸麦锁定（置顶，进房前先开） ----
-    kp_row_switch(c, y, w, @"一键霸麦锁定（防削波/防压制）", g_oneTapMasterLock, ^(BOOL on) {
-        kp_toggle_master_lock(on);
-    });
-    y += 30;
+    // v30.3：一键霸麦开关已移到悬浮面板顶部（VU 正下方），这里不再重复放一个
 
     // ---- 第 1 级 Vocal Range ----
     kp_row_switch(c, y, w, @"1 · Vocal Range 喉音", g_throatEnabled, ^(BOOL on) {
