@@ -100,7 +100,7 @@ static _Atomic long g_mixCalls  = 0;
 static _Atomic long g_frames    = 0;
 static _Atomic int  g_hookState = 0;
 
-#define KP_VERSION @"v30.4"
+#define KP_VERSION @"v30.5"
 #define HPF_ALPHA_80HZ 0.9896f
 #define MAX_CHANNELS   8
 #define REVERB_CH      2
@@ -2485,19 +2485,12 @@ static UIView        *g_vuOutFill = nil;
 static CGFloat        g_vuTrackW  = 84.0;
 
 #define KP_PANEL_W  300.0f
-#define KP_PANEL_H  502.0f
-#define KP_PAGE_Y    92.0f
-#define KP_PAGE_H   380.0f
+#define KP_PANEL_H  470.0f
+#define KP_PAGE_Y    74.0f
+#define KP_PAGE_H   374.0f
 static UILabel       *g_statLabel = nil;
 static UILabel       *g_bgmLabel = nil;
 static UISwitch      *g_bgmSwitch = nil;
-// v30.2：面板顶部快捷三件套（VU 正下方，房间里不用翻页）
-static UISwitch      *g_topLockSw = nil;
-
-static void kp_sync_quick_sw(void) {
-    if (g_topLockSw) g_topLockSw.on = (g_oneTapMasterLock != 0);
-    if (g_bgmSwitch) g_bgmSwitch.on = (g_bgmOn != 0);
-}
 static UILabel       *g_clipStat = nil;
 static UIButton      *g_recBtn = nil;
 static UISwitch      *g_clipLoopSw = nil;
@@ -2563,7 +2556,7 @@ static void kp_bgm_load_name(NSString *name) {
             g_bgmName = name;
             [[NSUserDefaults standardUserDefaults] setObject:name forKey:KEY_BGM_NAME];
             g_bgmOn = 1;
-            kp_sync_quick_sw();
+            if (g_bgmSwitch) g_bgmSwitch.on = YES;
             kp_log(@"bgm load %@ (%.1fs)", name, (double)n / 48000.0);
         });
     });
@@ -2574,7 +2567,7 @@ static void kp_bgm_delete_name(NSString *name) {
     if (!name.length) return;
     if (g_bgmName && [g_bgmName isEqualToString:name]) {
         kp_delete_bgm();
-        kp_sync_quick_sw();
+        if (g_bgmSwitch) g_bgmSwitch.on = NO;
     }
     [[NSFileManager defaultManager] removeItemAtPath:kp_bgm_path(name) error:nil];
     kp_log(@"bgm deleted: %@", name);
@@ -3666,16 +3659,6 @@ static void kp_build_panel(void) {
         save_current_settings();
     }] forControlEvents:UIControlEventTouchUpInside];
     [g_panel addSubview:close];
-
-    // v30.4：顶部只留一键霸麦锁定；BGM 开关 / 说话闪避 沿用“音效”页原有那两个，不重复放
-    CGFloat qy = 62;
-    UIColor *qfg = [UIColor colorWithWhite:0.72 alpha:1.0];
-    [g_panel addSubview:kp_label(CGRectMake(16, qy + 3, w - 84, 16), @"🔒 一键霸麦锁定", 9, qfg, YES)];
-    g_topLockSw = kp_switch(CGRectMake(w - 62, qy, 46, 22), (g_oneTapMasterLock != 0), ^(BOOL on) {
-        kp_toggle_master_lock(on);
-        kp_sync_quick_sw();
-    });
-    [g_panel addSubview:g_topLockSw];
 
     kp_build_rack_page(w);
     kp_build_eq_page(w);
