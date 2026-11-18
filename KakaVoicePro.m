@@ -100,7 +100,7 @@ static _Atomic long g_mixCalls  = 0;
 static _Atomic long g_frames    = 0;
 static _Atomic int  g_hookState = 0;
 
-#define KP_VERSION @"v30.0"
+#define KP_VERSION @"v30.1"
 #define HPF_ALPHA_80HZ 0.9896f
 #define MAX_CHANNELS   8
 #define REVERB_CH      2
@@ -2058,7 +2058,7 @@ static inline void kp_process_pcm(int16_t *pcm, UInt32 frames, UInt32 chs, BOOL 
 
         if (isPrimary) {
             BOOL clipOn = (g_clipOn != 0);
-            BOOL duckOn = (g_duckEnabled || g_oneTapMasterLock);
+            BOOL duckOn = g_duckEnabled;   // v30.1：闪避只由“说话闪避”开关决定，一键锁定不再强制
             float floorV = g_bgmDuckFloor > 0.02f ? g_bgmDuckFloor : 0.20f;
             float target = (duckOn && (rawPeak > 0.025f || clipOn)) ? floorV : 1.0f;
             float dt  = (float)curFrames / fs;
@@ -2067,14 +2067,7 @@ static inline void kp_process_pcm(int16_t *pcm, UInt32 frames, UInt32 chs, BOOL 
             if (a > 1.0f) a = 1.0f;
             g_duckGain += (target - g_duckGain) * a;
 
-            // 有伴奏/音效/话术在播时，人声平滑让位，避免两路一起撞天花板
-            BOOL musicOn = (g_bgmOn != 0) || clipOn;
-            for (int s = 0; s < SFX_SLOT; s++) { if (g_sfxOn[s]) { musicOn = YES; break; } }
-            float mg = musicOn ? 0.62f : 1.0f;
-            float am = 1.0f - expf(-dt / 0.05f);
-            g_musicDuck += (mg - g_musicDuck) * am;
-            if (g_musicDuck > 1.0f) g_musicDuck = 1.0f;
-            if (g_musicDuck < 0.55f) g_musicDuck = 0.55f;
+            // v30.1：取消“人声给伴奏让幅”，BGM 与人声同级，靠限幅总线统一控峰
         }
 
         for (UInt32 f = 0; f < curFrames; f++) {
@@ -2093,15 +2086,9 @@ static inline void kp_process_pcm(int16_t *pcm, UInt32 frames, UInt32 chs, BOOL 
 
             L *= gain * g_rmsTrim;
             R *= gain * g_rmsTrim;
-            if (g_limiterEnabled && g_boostOn) {
-                L = kp_limiter_tick(L, chOff + 0, ceilNorm);
-                if (chs >= 2) R = kp_limiter_tick(R, chOff + 1, ceilNorm);
-            } else {
-                L = tanhf(L) * ceilNorm;
-                if (chs >= 2) R = tanhf(R) * ceilNorm;
-            }
 
-            // v29.9：双总线独立限幅 + 平滑侧链避让（伴奏绝不顶爆人声）
+            // v30.1：BGM/音效/话术移入限幅器【之前】，与人声共用同一条防掐断总线。
+            // 人声+伴奏作为一个整体过前瞻限幅，波峰因数保留，网关才会把它当正常语音流放行。
             if (isPrimary) {
                 float mus = 0.0f;
                 for (int s = 0; s < SFX_SLOT; s++) {
@@ -2113,9 +2100,9 @@ static inline void kp_process_pcm(int16_t *pcm, UInt32 frames, UInt32 chs, BOOL 
                 }
                 if (g_bgmOn && g_bgmPcm && g_bgmLen > 0) {
                     int pos = g_bgmPos;
-                    if (pos >= g_bgmLen) pos = 0;
-                    // 侧链避让：开避让或一键锁定时，人声一响伴奏退到 g_bgmDuckFloor
-                    float duckFactor = (g_duckEnabled || g_oneTapMasterLock) ? g_duckGain : 1.0f;
+                    if (pos >= g_bgmLen) pos = 0;   // 自动无缝循环
+                    // 只有在“说话闪避”打开时才让位，否则 BGM 全功率与人声平级
+                    float duckFactor = g_duckEnabled ? g_duckGain : 1.0f;
                     mus += (float)g_bgmPcm[pos] * g_bgmVolume * duckFactor;
                     g_bgmPos = pos + 1;
                 }
@@ -2132,21 +2119,21 @@ static inline void kp_process_pcm(int16_t *pcm, UInt32 frames, UInt32 chs, BOOL 
                 }
                 if (mus != 0.0f) {
                     float m = mus * (1.0f / 32768.0f);
-                    // 音乐总线先独立软限幅，峰值控制在 0.65 以内
+                    // 音乐自身先做一次软封顶，避免单路就把总线顶穿
                     if (m > 0.65f)  m = 0.65f + 0.15f * tanhf((m - 0.65f) * 4.0f);
                     if (m < -0.65f) m = -0.65f + 0.15f * tanhf((m + 0.65f) * 4.0f);
-
-                    // 锁定模式下人声几乎不降幅，直接盖在避让后的伴奏上
-                    float voiceKeep = g_oneTapMasterLock ? 0.92f : g_musicDuck;
-                    L = L * voiceKeep + m;
-                    R = R * voiceKeep + m;
-
-                    // 总线砖墙保护：硬钳位，绝不进入 tanh 削波区
-                    if (L >  ceilNorm) L =  ceilNorm;
-                    if (L < -ceilNorm) L = -ceilNorm;
-                    if (R >  ceilNorm) R =  ceilNorm;
-                    if (R < -ceilNorm) R = -ceilNorm;
+                    L += m;
+                    R += m;
                 }
+            }
+
+            // 人声+BGM 一起进前瞻限幅，输出峰值锁在 ceiling，不产生方波
+            if (g_limiterEnabled && g_boostOn) {
+                L = kp_limiter_tick(L, chOff + 0, ceilNorm);
+                if (chs >= 2) R = kp_limiter_tick(R, chOff + 1, ceilNorm);
+            } else {
+                L = tanhf(L) * ceilNorm;
+                if (chs >= 2) R = tanhf(R) * ceilNorm;
             }
 
             float pL = fabsf(L), pR = (chs >= 2) ? fabsf(R) : 0.0f;
@@ -2819,8 +2806,8 @@ static void kp_toggle_master_lock(BOOL lock) {
         g_shieldLowOnly    = YES;
         kp_shield_apply();
 
-        // BGM 联动避让
-        if (g_bgmMasterSync) g_duckEnabled = YES;
+        // v30.1：锁定不碰 BGM 开关与“说话闪避”开关，放不放歌你自己控
+        g_opusBitrateBps   = 192000; // 黄金并发档：放歌接近无损，多人房不被拥塞踢出
 
         // 锁死 10 段曲线：削 120Hz 以下浑浊，2.5k/4.2k 提亮穿透
         static const float masterEq[EQ10_BANDS] = {
@@ -2830,7 +2817,7 @@ static void kp_toggle_master_lock(BOOL lock) {
             g_eq10Gains[i] = masterEq[i];
         }
         kp_rebuild_filter_bank();
-        kp_log(@"[MASTER-LOCK] 一键霸麦已锁定：清晰度+穿透力+伴奏联动全开");
+        kp_log(@"[MASTER-LOCK] 一键霸麦已锁定：防削波电平+高穿透音色+192k并发档");
     } else {
         g_shieldRemote = NO;
         kp_shield_apply();
@@ -4291,6 +4278,23 @@ static void kp_hook_mixProc(id self, SEL _cmd, int16_t *pcm, unsigned long long 
     }
 }
 
+// ---------- v30.1：防“超 3 人房”偷偷关采集轨 / 重置采集门限 ----------
+static void (*kp_orig_setCapTrackEn)(id, SEL, id, BOOL) = NULL;
+static void (*kp_orig_resetCapGate)(id, SEL) = NULL;
+
+static void kp_hook_setCapTrackEn(id self, SEL _cmd, id track, BOOL en) {
+    if (g_oneTapMasterLock || g_priorityLoud) en = YES;   // 锁定时禁止业务层关采集
+    if (kp_orig_setCapTrackEn) kp_orig_setCapTrackEn(self, _cmd, track, en);
+}
+
+static void kp_hook_resetCapGate(id self, SEL _cmd) {
+    if (g_oneTapMasterLock || g_priorityLoud) {
+        kp_log(@"[anticut] 拦截多人房重置采集门限");
+        return;
+    }
+    if (kp_orig_resetCapGate) kp_orig_resetCapGate(self, _cmd);
+}
+
 static void kp_setup_kaka_allow_hooks(void) {
     if (kp_kakaAllowHooked) return;
 
@@ -4315,6 +4319,23 @@ static void kp_setup_kaka_allow_hooks(void) {
             ok = YES;
         }
         kp_log(@"[allow] dev gate get=%d set=%d", g != NULL, s != NULL);
+
+        // v30.1：封死“第 4 个人上麦时关采集轨 / 重置采集门限”的后门
+        SEL ctSel = NSSelectorFromString(@"kakaSetCaptureTrack:enabled:");
+        Method ct = class_getInstanceMethod(dev, ctSel);
+        if (ct) {
+            kp_orig_setCapTrackEn = (void (*)(id, SEL, id, BOOL))method_getImplementation(ct);
+            method_setImplementation(ct, (IMP)kp_hook_setCapTrackEn);
+            ok = YES;
+        }
+        SEL rcSel = NSSelectorFromString(@"kakaResetCaptureGate");
+        Method rc = class_getInstanceMethod(dev, rcSel);
+        if (rc) {
+            kp_orig_resetCapGate = (void (*)(id, SEL))method_getImplementation(rc);
+            method_setImplementation(rc, (IMP)kp_hook_resetCapGate);
+            ok = YES;
+        }
+        kp_log(@"[anticut] setCaptureTrack=%d resetCapGate=%d", ct != NULL, rc != NULL);
     }
     if (mix) {
         SEL gSel = NSSelectorFromString(@"roomMusicAllowed");
