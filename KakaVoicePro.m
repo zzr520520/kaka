@@ -100,7 +100,7 @@ static _Atomic long g_mixCalls  = 0;
 static _Atomic long g_frames    = 0;
 static _Atomic int  g_hookState = 0;
 
-#define KP_VERSION @"v30.3"
+#define KP_VERSION @"v30.4"
 #define HPF_ALPHA_80HZ 0.9896f
 #define MAX_CHANNELS   8
 #define REVERB_CH      2
@@ -2486,20 +2486,16 @@ static CGFloat        g_vuTrackW  = 84.0;
 
 #define KP_PANEL_W  300.0f
 #define KP_PANEL_H  502.0f
-#define KP_PAGE_Y   106.0f
-#define KP_PAGE_H   370.0f
+#define KP_PAGE_Y    92.0f
+#define KP_PAGE_H   380.0f
 static UILabel       *g_statLabel = nil;
 static UILabel       *g_bgmLabel = nil;
 static UISwitch      *g_bgmSwitch = nil;
 // v30.2：面板顶部快捷三件套（VU 正下方，房间里不用翻页）
 static UISwitch      *g_topLockSw = nil;
-static UISwitch      *g_topBgmSw  = nil;
-static UISwitch      *g_topDuckSw = nil;
 
 static void kp_sync_quick_sw(void) {
     if (g_topLockSw) g_topLockSw.on = (g_oneTapMasterLock != 0);
-    if (g_topBgmSw)  g_topBgmSw.on  = (g_bgmOn != 0);
-    if (g_topDuckSw) g_topDuckSw.on = (g_duckEnabled != 0);
     if (g_bgmSwitch) g_bgmSwitch.on = (g_bgmOn != 0);
 }
 static UILabel       *g_clipStat = nil;
@@ -3671,39 +3667,15 @@ static void kp_build_panel(void) {
     }] forControlEvents:UIControlEventTouchUpInside];
     [g_panel addSubview:close];
 
-    // v30.2：快捷三件套（VU 正下方）：一键霸麦锁定 / BGM 开关 / 说话闪避
-    CGFloat qy = 62, qW = 86;
+    // v30.4：顶部只留一键霸麦锁定；BGM 开关 / 说话闪避 沿用“音效”页原有那两个，不重复放
+    CGFloat qy = 62;
     UIColor *qfg = [UIColor colorWithWhite:0.72 alpha:1.0];
-    [g_panel addSubview:kp_label(CGRectMake(16, qy, qW, 11), @"🔒 霸麦锁定", 9, qfg, YES)];
-    g_topLockSw = kp_switch(CGRectMake(16, qy + 13, 46, 22), (g_oneTapMasterLock != 0), ^(BOOL on) {
+    [g_panel addSubview:kp_label(CGRectMake(16, qy + 3, w - 84, 16), @"🔒 一键霸麦锁定", 9, qfg, YES)];
+    g_topLockSw = kp_switch(CGRectMake(w - 62, qy, 46, 22), (g_oneTapMasterLock != 0), ^(BOOL on) {
         kp_toggle_master_lock(on);
         kp_sync_quick_sw();
     });
     [g_panel addSubview:g_topLockSw];
-
-    [g_panel addSubview:kp_label(CGRectMake(16 + qW + 2, qy, qW, 11), @"🎵 BGM", 9, qfg, YES)];
-    g_topBgmSw = kp_switch(CGRectMake(16 + qW + 2, qy + 13, 46, 22), (g_bgmOn != 0), ^(BOOL on) {
-        if (on && g_bgmLen == 0) {
-            NSArray<NSString *> *files = kp_bgm_files();
-            NSString *pick = nil;
-            if (g_bgmName.length && [files containsObject:g_bgmName]) pick = g_bgmName;
-            else pick = files.firstObject;
-            if (pick) { kp_bgm_load_name(pick); kp_sync_quick_sw(); return; }
-            [g_win kp_show_toast:@"还没有伴奏，先点导入"];
-        } else {
-            g_bgmOn = on ? 1 : 0;
-        }
-        kp_sync_quick_sw();
-    });
-    [g_panel addSubview:g_topBgmSw];
-
-    [g_panel addSubview:kp_label(CGRectMake(16 + 2 * (qW + 2), qy, qW, 11), @"⚡ 说话闪避", 9, qfg, YES)];
-    g_topDuckSw = kp_switch(CGRectMake(16 + 2 * (qW + 2), qy + 13, 46, 22), (g_duckEnabled != 0), ^(BOOL on) {
-        g_duckEnabled = on;
-        save_current_settings();
-        kp_sync_quick_sw();
-    });
-    [g_panel addSubview:g_topDuckSw];
 
     kp_build_rack_page(w);
     kp_build_eq_page(w);
