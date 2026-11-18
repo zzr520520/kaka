@@ -807,3 +807,23 @@ int crypto_sign_open(u8 *m,u64 *mlen,const u8 *sm,u64 n,const u8 *pk)
   *mlen = n;
   return 0;
 }
+
+/* 由 32 字节种子确定性导出密钥对（本项目新增，便于私钥固定嵌入） */
+int crypto_sign_seed_keypair_seed(u8 *pk, u8 *sk, const u8 *seed)
+{
+  u8 d[64];
+  gf p[4];
+  int i;
+
+  FOR(i,32) sk[i] = seed[i];
+  crypto_hash(d, sk, 32);
+  d[0] &= 248;
+  d[31] &= 127;
+  d[31] |= 64;
+
+  scalarbase(p, d);
+  pack(pk, p);
+
+  FOR(i,32) sk[32 + i] = pk[i];
+  return 0;
+}
