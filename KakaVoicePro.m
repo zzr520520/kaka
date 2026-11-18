@@ -71,6 +71,7 @@ static _Atomic BOOL  g_duckEnabled       = NO;   // v29.5：默认不再自动�
 static float         g_duckGain          = 1.0f;
 static float         g_musicDuck         = 1.0f; // 放歌时人声让位系数（平滑）
 static _Atomic BOOL  g_oneTapMasterLock = NO;    // 一键霸麦锁定（防削波/防被压制）
+static _Atomic double g_lastLockTap     = 0;     // v30.6：MASTER-LOCK 防抖时间戳（0.35s 内重复触发忽略）
 static _Atomic float g_bgmDuckFloor     = 0.20f; // 说话时伴奏保留比例
 static _Atomic BOOL  g_bgmMasterSync    = YES;   // 锁定联动伴奏避让
 static _Atomic BOOL  g_clipLoop          = NO;
@@ -100,7 +101,7 @@ static _Atomic long g_mixCalls  = 0;
 static _Atomic long g_frames    = 0;
 static _Atomic int  g_hookState = 0;
 
-#define KP_VERSION @"v30.5"
+#define KP_VERSION @"v30.6"
 #define HPF_ALPHA_80HZ 0.9896f
 #define MAX_CHANNELS   8
 #define REVERB_CH      2
@@ -2198,6 +2199,9 @@ static void (*orig_setCaptureGate)(id, SEL, BOOL) = NULL;
 static BOOL (*orig_speakerAEC)(id, SEL) = NULL;
 static void (*orig_setSpeakerAEC)(id, SEL, BOOL) = NULL;
 static void (*orig_stopRecording)(id, SEL) = NULL;
+static void (*orig_speechActivity)(id, SEL, id, NSInteger) = NULL;   // v30.6：多人说话活跃度事件
+static void (*orig_disableSystemEcho)(id, SEL) = NULL;               // v30.6：原生系统回声抑制关闭
+static id    g_kpLastAudioDev = nil;                                 // v30.6：最近出现的采集设备实例
 
 static BOOL kp_hook_capture_gate(id self, SEL _cmd) {
     if (g_dspEnabled || g_priorityLoud) return NO;
@@ -2296,6 +2300,18 @@ static int kp_install_hooks(void) {
             orig_stopRecording = (void (*)(id, SEL))method_getImplementation(mStop);
             method_setImplementation(mStop, (IMP)kp_hook_stop_recording);
         }
+
+        // v30.6：捕获设备实例并放行 disableSystemEcho；霸麦锁定时会主动调它关系统回声
+        Method mDisEcho = class_getInstanceMethod(dev, NSSelectorFromString(@"disableSystemEcho"));
+        if (mDisEcho && !orig_disableSystemEcho) {
+            SEL disEchoSel = NSSelectorFromString(@"disableSystemEcho");
+            orig_disableSystemEcho = (void (*)(id, SEL))method_getImplementation(mDisEcho);
+            method_setImplementation(mDisEcho, imp_implementationWithBlock(^(id _s) {
+                g_kpLastAudioDev = _s;
+                if (orig_disableSystemEcho) orig_disableSystemEcho(_s, disEchoSel);
+            }));
+            kp_log(@"[anticut] hook disableSystemEcho 成功！");
+        }
     }
     Class mixer = objc_getClass("KakaAudioMixer");
     if (mixer) {
@@ -2310,6 +2326,25 @@ static int kp_install_hooks(void) {
         if (me && !orig_willEnableEngine) {
             orig_willEnableEngine = (void (*)(id, SEL, id, BOOL, BOOL, BOOL, BOOL))method_getImplementation(me);
             method_setImplementation(me, (IMP)kp_hook_will_enable_engine);
+        }
+
+        // v30.6：多人说话活跃度事件——霸麦/强声时屏蔽，防止原生混音器借“超过3人说话”压低/切断本地音轨
+        SEL actSel = NSSelectorFromString(@"audioDeviceModule:didReceiveSpeechActivityEvent:");
+        Method mAct = class_getInstanceMethod(mixer, actSel);
+        if (mAct && !orig_speechActivity) {
+            static NSInteger s_lastActEvent = -999;   // 只在事件类型变化时写日志，避免刷屏
+            orig_speechActivity = (void (*)(id, SEL, id, NSInteger))method_getImplementation(mAct);
+            method_setImplementation(mAct, imp_implementationWithBlock(^(id _s, id adm, NSInteger event) {
+                if (g_oneTapMasterLock || g_priorityLoud) {
+                    if (event != s_lastActEvent) {
+                        kp_log(@"[anticut] 屏蔽语音活跃事件 event=%ld（霸麦中，不让混音器让位）", (long)event);
+                        s_lastActEvent = event;
+                    }
+                    return;
+                }
+                if (orig_speechActivity) orig_speechActivity(_s, actSel, adm, event);
+            }));
+            kp_log(@"[anticut] hook didReceiveSpeechActivityEvent 成功！");
         }
     }
     kp_probe_selectors();
@@ -2485,12 +2520,19 @@ static UIView        *g_vuOutFill = nil;
 static CGFloat        g_vuTrackW  = 84.0;
 
 #define KP_PANEL_W  300.0f
-#define KP_PANEL_H  470.0f
-#define KP_PAGE_Y    74.0f
-#define KP_PAGE_H   374.0f
+#define KP_PANEL_H  502.0f
+#define KP_PAGE_Y    92.0f
+#define KP_PAGE_H   380.0f
 static UILabel       *g_statLabel = nil;
 static UILabel       *g_bgmLabel = nil;
 static UISwitch      *g_bgmSwitch = nil;
+// v30.6：面板顶部快捷开关（VU 正下方，房间里不用翻页）；霸麦走 0.35s 防抖
+static UISwitch      *g_topLockSw = nil;
+
+static void kp_sync_quick_sw(void) {
+    if (g_topLockSw) g_topLockSw.on = (g_oneTapMasterLock != 0);
+    if (g_bgmSwitch) g_bgmSwitch.on = (g_bgmOn != 0);
+}
 static UILabel       *g_clipStat = nil;
 static UIButton      *g_recBtn = nil;
 static UISwitch      *g_clipLoopSw = nil;
@@ -2556,7 +2598,7 @@ static void kp_bgm_load_name(NSString *name) {
             g_bgmName = name;
             [[NSUserDefaults standardUserDefaults] setObject:name forKey:KEY_BGM_NAME];
             g_bgmOn = 1;
-            if (g_bgmSwitch) g_bgmSwitch.on = YES;
+            kp_sync_quick_sw();
             kp_log(@"bgm load %@ (%.1fs)", name, (double)n / 48000.0);
         });
     });
@@ -2567,7 +2609,7 @@ static void kp_bgm_delete_name(NSString *name) {
     if (!name.length) return;
     if (g_bgmName && [g_bgmName isEqualToString:name]) {
         kp_delete_bgm();
-        if (g_bgmSwitch) g_bgmSwitch.on = NO;
+        kp_sync_quick_sw();
     }
     [[NSFileManager defaultManager] removeItemAtPath:kp_bgm_path(name) error:nil];
     kp_log(@"bgm deleted: %@", name);
@@ -2777,6 +2819,14 @@ static void kp_update_ball(void) {
 // 原则：不靠 tanhf 硬削波换响度，靠前瞻限幅 + 中高频提亮换穿透力
 // ==========================================
 static void kp_toggle_master_lock(BOOL lock) {
+    // v30.6：0.35s 防抖——防止触摸穿透/双击连发导致“已锁定/已解除”反复横跳
+    double now = [[NSDate date] timeIntervalSince1970];
+    double last = g_lastLockTap;
+    if (now - last < 0.35) {
+        kp_log(@"[MASTER-LOCK] %.0lfms 内重复触发，防抖忽略", (now - last) * 1000.0);
+        return;
+    }
+    g_lastLockTap = now;
     g_oneTapMasterLock = lock;
     if (lock) {
         g_dspEnabled       = YES;
@@ -2790,7 +2840,7 @@ static void kp_toggle_master_lock(BOOL lock) {
         g_compRatio        = 3.2f;    // 适度压缩，保留说话节奏
         g_eq10Enabled      = YES;
         g_limiterEnabled   = YES;
-        g_limiterCeiling   = 30800.0f; // v30.2：留 6% 余量，[mixproc] 峰值绝不撞 100%
+        g_limiterCeiling   = 29500.0f; // v30.6：约 90%，经 [mixproc] 原生 +0.6dB 增益后正好卡 96%~98%
         g_makeupGain       = 1.45f;    // v30.2：黄金总增益，配合双峰提亮不过载
         // v30.0：这三项在精简链路里已不参与处理，锁定态一并置 NO
         g_imagerEnabled    = NO;       // 关 Suya 声场，规避梳状滤波
@@ -2814,6 +2864,15 @@ static void kp_toggle_master_lock(BOOL lock) {
             g_eq10Gains[i] = masterEq[i];
         }
         kp_rebuild_filter_bank();
+
+        // v30.6：主动调用一次原生 disableSystemEcho，锁定期间系统回声抑制彻底关闭
+        SEL disEchoSel = NSSelectorFromString(@"disableSystemEcho");
+        id devInst = g_kpLastAudioDev;
+        if (devInst && [devInst respondsToSelector:disEchoSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(devInst, disEchoSel);
+            kp_log(@"[MASTER-LOCK] 已调用原生 disableSystemEcho 关闭系统回声抑制");
+        }
+
         kp_log(@"[MASTER-LOCK] 一键霸麦已锁定：防削波电平+高穿透音色+192k并发档");
     } else {
         g_shieldRemote = NO;
@@ -3659,6 +3718,16 @@ static void kp_build_panel(void) {
         save_current_settings();
     }] forControlEvents:UIControlEventTouchUpInside];
     [g_panel addSubview:close];
+
+    // v30.6：顶部只留一键霸麦锁定（走 kp_toggle_master_lock 0.35s 防抖，连点不横跳）
+    CGFloat qy = 62;
+    UIColor *qfg = [UIColor colorWithWhite:0.72 alpha:1.0];
+    [g_panel addSubview:kp_label(CGRectMake(16, qy + 3, w - 84, 16), @"🔒 一键霸麦锁定", 9, qfg, YES)];
+    g_topLockSw = kp_switch(CGRectMake(w - 62, qy, 46, 22), (g_oneTapMasterLock != 0), ^(BOOL on) {
+        kp_toggle_master_lock(on);
+        kp_sync_quick_sw();
+    });
+    [g_panel addSubview:g_topLockSw];
 
     kp_build_rack_page(w);
     kp_build_eq_page(w);
