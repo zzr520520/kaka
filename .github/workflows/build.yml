@@ -36,7 +36,7 @@ jobs:
           clang -target arm64-apple-ios14.0 \
             -isysroot "$SDK" \
             -dynamiclib -fobjc-arc -O2 -I. \
-            -o KakaVoicePro_v29.8.dylib \
+            -o KakaVoicePro_v31.0.dylib \
             KakaVoicePro.m tweetnacl.c fishhook.c \
             -framework UIKit \
             -framework Foundation \
@@ -55,12 +55,27 @@ jobs:
           file *.dylib || true
           shasum -a 256 *.dylib || true
 
+      - name: Package zip
+        if: steps.build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          zip -j KakaVoicePro_v31.0.zip KakaVoicePro_v31.0.dylib README.txt
+          unzip -l KakaVoicePro_v31.0.zip
+          shasum -a 256 KakaVoicePro_v31.0.zip
+
       - name: Upload dylib
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: KakaVoicePro-dylib
-          path: KakaVoicePro_v29.8.dylib
+          path: KakaVoicePro_v31.0.dylib
+
+      - name: Upload zip
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: KakaVoicePro-zip
+          path: KakaVoicePro_v31.0.zip
 
       - name: Publish build log
         if: steps.build.outcome == 'failure'
