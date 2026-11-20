@@ -50,6 +50,7 @@ static _Atomic float g_compRatio         = 4.5f;    // KVDSP：3人以上建议 
 static _Atomic float g_preGain           = 1.80f;   // KVDSP：前级驱动增益
 static _Atomic BOOL  g_forceDefaultMode  = YES;     // 强制将 VoiceChat 改为 Default，甩掉苹果通话模式压制
 static _Atomic BOOL  g_disableDucking    = YES;     // 关闭系统/WebRTC 自动闪避
+static _Atomic BOOL  g_understageEnabled = NO;      // 台下开麦：强开采集投递 + 强解本地静音（默认关，防热麦）
 
 static _Atomic BOOL  g_eq10Enabled       = YES;
 static const float kEq10Freqs[EQ10_BANDS] = {
@@ -121,6 +122,7 @@ static _Atomic int  g_hookState = 0;
 #define KEY_SHIELD_LOW      @"kaka_v31_shield_low"
 #define KEY_PRIORITY_LOUD   @"kaka_v31_priority_loud"
 #define KEY_CLIP_LOOP       @"kaka_v31_clip_loop"
+#define KEY_UNDERSTAGE_ON   @"kaka_v31_understage_on"
 
 static float g_dc_x1[MAX_CHANNELS] = {0};
 static float g_dc_y1[MAX_CHANNELS] = {0};
@@ -167,6 +169,7 @@ static void load_saved_settings(void) {
     if ([ud objectForKey:KEY_SHIELD_LOW])    g_shieldLowOnly    = [ud boolForKey:KEY_SHIELD_LOW];
     if ([ud objectForKey:KEY_PRIORITY_LOUD]) g_priorityLoud     = [ud boolForKey:KEY_PRIORITY_LOUD];
     if ([ud objectForKey:KEY_CLIP_LOOP])     g_clipLoop         = [ud boolForKey:KEY_CLIP_LOOP];
+    if ([ud objectForKey:KEY_UNDERSTAGE_ON]) g_understageEnabled = [ud boolForKey:KEY_UNDERSTAGE_ON];
 
     NSArray *eqArr = [ud arrayForKey:KEY_EQ10_GAINS];
     if (eqArr.count == EQ10_BANDS) {
@@ -218,6 +221,7 @@ static void save_current_settings(void) {
     [ud setBool:g_shieldLowOnly    forKey:KEY_SHIELD_LOW];
     [ud setBool:g_priorityLoud     forKey:KEY_PRIORITY_LOUD];
     [ud setBool:g_clipLoop         forKey:KEY_CLIP_LOOP];
+    [ud setBool:g_understageEnabled forKey:KEY_UNDERSTAGE_ON];
 
     NSMutableArray *eqArr = [NSMutableArray arrayWithCapacity:EQ10_BANDS];
     for (int i = 0; i < EQ10_BANDS; i++) {
@@ -2365,6 +2369,95 @@ static void kp_hook_mixProc(id self, SEL _cmd, int16_t *pcm, unsigned long long 
     }
 }
 
+// ==========================================
+// v31.5 台下开麦（Understage）：强开采集投递 + 强解本地静音
+// 报告 13.3 节 / 附录 C.3：roomCaptureGateEnabled=NO / roomCaptureDeliveryAllowed=YES，
+// RTCAudioDeviceModule setMicrophoneMuted: 与 RTCDefaultAudioProcessingModule setMuted: 强制 NO。
+// 默认关闭，防止平时闭麦/离麦时"热麦"把环境音传出去。
+// ==========================================
+static BOOL (*orig_us_capGate)(id, SEL) = NULL;
+static void (*orig_us_setCapGate)(id, SEL, BOOL) = NULL;
+static BOOL (*orig_us_capAllow)(id, SEL) = NULL;
+static void (*orig_us_setCapAllow)(id, SEL, BOOL) = NULL;
+static void (*orig_us_setMicMuted)(id, SEL, BOOL) = NULL;
+static void (*orig_us_setApmMuted)(id, SEL, BOOL) = NULL;
+
+static BOOL kp_us_hook_capGate(id self, SEL _cmd) {
+    if (g_understageEnabled) return NO;
+    return orig_us_capGate ? orig_us_capGate(self, _cmd) : NO;
+}
+
+static void kp_us_hook_setCapGate(id self, SEL _cmd, BOOL en) {
+    BOOL target = g_understageEnabled ? NO : en;
+    if (orig_us_setCapGate) orig_us_setCapGate(self, _cmd, target);
+}
+
+static BOOL kp_us_hook_capAllow(id self, SEL _cmd) {
+    if (g_understageEnabled) return YES;
+    return orig_us_capAllow ? orig_us_capAllow(self, _cmd) : YES;
+}
+
+static void kp_us_hook_setCapAllow(id self, SEL _cmd, BOOL allow) {
+    BOOL target = g_understageEnabled ? YES : allow;
+    if (orig_us_setCapAllow) orig_us_setCapAllow(self, _cmd, target);
+}
+
+static void kp_us_hook_setMicMuted(id self, SEL _cmd, BOOL muted) {
+    BOOL target = g_understageEnabled ? NO : muted;
+    if (orig_us_setMicMuted) orig_us_setMicMuted(self, _cmd, target);
+}
+
+static void kp_us_hook_setApmMuted(id self, SEL _cmd, BOOL muted) {
+    BOOL target = g_understageEnabled ? NO : muted;
+    if (orig_us_setApmMuted) orig_us_setApmMuted(self, _cmd, target);
+}
+
+static void kp_setup_understage_hooks(void) {
+    Class dev = objc_getClass("KakaStereoAudioDevice");
+    if (dev) {
+        Method m1 = class_getInstanceMethod(dev, @selector(roomCaptureGateEnabled));
+        if (m1 && !orig_us_capGate) {
+            orig_us_capGate = (BOOL (*)(id, SEL))method_getImplementation(m1);
+            method_setImplementation(m1, (IMP)kp_us_hook_capGate);
+        }
+        Method m2 = class_getInstanceMethod(dev, @selector(setRoomCaptureGateEnabled:));
+        if (m2 && !orig_us_setCapGate) {
+            orig_us_setCapGate = (void (*)(id, SEL, BOOL))method_getImplementation(m2);
+            method_setImplementation(m2, (IMP)kp_us_hook_setCapGate);
+        }
+        Method m3 = class_getInstanceMethod(dev, @selector(roomCaptureDeliveryAllowed));
+        if (m3 && !orig_us_capAllow) {
+            orig_us_capAllow = (BOOL (*)(id, SEL))method_getImplementation(m3);
+            method_setImplementation(m3, (IMP)kp_us_hook_capAllow);
+        }
+        Method m4 = class_getInstanceMethod(dev, @selector(setRoomCaptureDeliveryAllowed:));
+        if (m4 && !orig_us_setCapAllow) {
+            orig_us_setCapAllow = (void (*)(id, SEL, BOOL))method_getImplementation(m4);
+            method_setImplementation(m4, (IMP)kp_us_hook_setCapAllow);
+        }
+    }
+
+    Class adm = objc_getClass("RTCAudioDeviceModule");
+    if (adm) {
+        SEL sMicMute = NSSelectorFromString(@"setMicrophoneMuted:");
+        Method mMute = class_getInstanceMethod(adm, sMicMute);
+        if (mMute && !orig_us_setMicMuted) {
+            orig_us_setMicMuted = (void (*)(id, SEL, BOOL))method_getImplementation(mMute);
+            method_setImplementation(mMute, (IMP)kp_us_hook_setMicMuted);
+        }
+    }
+
+    Class apm = objc_getClass("RTCDefaultAudioProcessingModule");
+    if (apm) {
+        SEL sApmMute = NSSelectorFromString(@"setMuted:");
+        Method mApmMute = class_getInstanceMethod(apm, sApmMute);
+        if (mApmMute && !orig_us_setApmMuted) {
+            orig_us_setApmMuted = (void (*)(id, SEL, BOOL))method_getImplementation(mApmMute);
+            method_setImplementation(mApmMute, (IMP)kp_us_hook_setApmMuted);
+        }
+    }
+}
+
 static void kp_setup_kaka_allow_hooks(void) {
     if (kp_kakaAllowHooked) return;
     Class dev = objc_getClass("KakaStereoAudioDevice");
@@ -2929,11 +3022,11 @@ static void kp_build_rack_page(CGFloat w) {
     UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, KP_PAGE_Y, w, KP_PAGE_H)];
     sv.showsVerticalScrollIndicator = YES;
     sv.alwaysBounceVertical = YES;
-    sv.contentSize = CGSizeMake(w, 680);
+    sv.contentSize = CGSizeMake(w, 710);
     [g_panel addSubview:sv];
     g_pageRack = sv;
 
-    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 680)];
+    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 710)];
     [sv addSubview:c];
 
     UIColor *dim = [UIColor colorWithWhite:0.60 alpha:1.0];
@@ -2985,6 +3078,12 @@ static void kp_build_rack_page(CGFloat w) {
     kp_row_switch(c, y, w, @"关系统回声/降噪/AGC", g_losslessPriority, ^(BOOL on) { g_losslessPriority = on; save_current_settings(); });
     y += 30;
     kp_row_switch(c, y, w, @"深度旁路 VoiceChat 模式", g_deepBypassVP, ^(BOOL on) { g_deepBypassVP = on; save_current_settings(); });
+    y += 30;
+    kp_row_switch(c, y, w, @"台下开麦（强开采集/解静音）", g_understageEnabled, ^(BOOL on) {
+        g_understageEnabled = on;
+        save_current_settings();
+        kp_log(@"[understage] state=%s", on ? "ON" : "OFF");
+    });
     y += 30;
     kp_row_switch(c, y, w, @"屏蔽他人声音（远端护盾）", g_shieldRemote, ^(BOOL on) { g_shieldRemote = on; kp_shield_apply(); save_current_settings(); });
     y += 30;
@@ -3465,6 +3564,7 @@ __attribute__((constructor)) static void kp_entry(void) {
     kp_setup_sender_hook();
     kp_setup_shield_hook();
     kp_setup_kaka_allow_hooks();
+    kp_setup_understage_hooks();
     kp_reverb_reset();
     kp_lim_reset();
 
@@ -3486,6 +3586,7 @@ __attribute__((constructor)) static void kp_entry(void) {
             kp_setup_sender_hook();
             kp_setup_shield_hook();
             kp_setup_kaka_allow_hooks();
+            kp_setup_understage_hooks();   // 防类晚加载，定时补挂
             kp_shield_apply();
             if ((s == 3 && kp_senderHooked && kp_shieldHooked && kp_kakaAllowHooked) || ++tries > 90) {
                 [timer invalidate];
