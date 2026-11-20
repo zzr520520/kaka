@@ -64,7 +64,7 @@ static _Atomic float g_reverbRoom        = 0.85f;
 static _Atomic float g_reverbWet         = 0.25f;
 
 static _Atomic BOOL  g_limiterEnabled    = YES;
-static _Atomic float g_makeupGain        = 1.50f;
+static _Atomic float g_makeupGain        = 2.50f;
 static _Atomic float g_limiterCeiling    = 29800.0f; // 留出余量，避免混音阶段硬顶 100% 变方波
 
 static _Atomic BOOL  g_mixDspEnabled     = YES;
@@ -178,7 +178,7 @@ static void load_saved_settings(void) {
         }
     }
 
-    if (g_makeupGain < 1.0f || g_makeupGain > 10.0f)                g_makeupGain = 2.20f;  // KVDSP 默认补偿增益
+    if (g_makeupGain < 1.0f || g_makeupGain > 10.0f)                g_makeupGain = 2.50f;  // KVDSP 默认补偿增益（v31.3：2.5~3.5 配 0.98 限幅）
     if (g_limiterCeiling < 20000.0f || g_limiterCeiling > 32700.0f) g_limiterCeiling = 29800.0f;
     if (g_compThresh < 0.05f || g_compThresh > 0.80f)               g_compThresh = 0.08f;  // KVDSP 默认门限
     if (g_compRatio < 1.2f || g_compRatio > 10.0f)                  g_compRatio = 4.5f;    // KVDSP 默认压缩比
@@ -2321,8 +2321,20 @@ static void kp_hook_setMusicAllow(id self, SEL _cmd, BOOL v) {
 static void kp_hook_mixProc(id self, SEL _cmd, int16_t *pcm, unsigned long long frames,
                             unsigned long long chs, double rate) {
     long n = ++g_mixProcCalls;
-    if (kp_orig_mixProc) kp_orig_mixProc(self, _cmd, pcm, frames, chs, rate);
 
+    // v31.3：mixProcessedPCM: 是 KAKA 1.2.4 真实的每秒最终上行出口（probe-m + 日志实证），
+    // 直接在这里接管处理，不再调用官方 orig_mixProc（彻底跳过官方混音衰减）
+    if (g_dspEnabled && pcm && frames > 0) {
+        if (rate >= 8000.0 && rate <= 96000.0 && fabsf((float)rate - g_sampleRate) > 10.0f) {
+            g_sampleRate = (float)rate;
+            kp_rebuild_filter_bank();
+        }
+        kp_process_pcm(pcm, (UInt32)frames, (UInt32)(chs > 0 ? chs : 1), YES);
+    } else if (kp_orig_mixProc) {
+        kp_orig_mixProc(self, _cmd, pcm, frames, chs, rate);
+    }
+
+    // 统计并打印真实输出电平（处理后）
     static double lastT = 0;
     static int peak = 0;
     static double sumSq = 0;
@@ -2343,8 +2355,8 @@ static void kp_hook_mixProc(id self, SEL _cmd, int16_t *pcm, unsigned long long 
     if (now - lastT >= 5.0) {
         double rms = (samples > 0) ? sqrt(sumSq / (double)samples) : 0.0;
         double db  = 20.0 * log10(rms > 1e-9 ? rms : 1e-9);
-        kp_log(@"[mixproc] calls=%ld frames=%llu ch=%llu rate=%.0f outPeak=%d%% outRMS=%.1fdB",
-               n, frames, chs, rate, peak, db);
+        kp_log(@"[KV-MIX-TAKEOVER] calls=%ld frames=%llu ch=%llu outPeak=%d%% outRMS=%.1fdB",
+               n, frames, chs, peak, db);
         lastT = now; peak = 0; sumSq = 0; samples = 0;
     }
 }
@@ -2770,7 +2782,7 @@ static void kp_toggle_master_lock(BOOL lock) {
         g_eq10Enabled      = YES;
         g_limiterEnabled   = YES;
         g_limiterCeiling   = 29800.0f;
-        g_makeupGain       = 2.20f;
+        g_makeupGain       = 2.50f;
         g_shieldRemote     = YES;
         g_shieldLowOnly    = YES;
         kp_shield_apply();
