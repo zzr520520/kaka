@@ -2322,9 +2322,20 @@ static void kp_hook_setMusicAllow(id self, SEL _cmd, BOOL v) {
     if (kp_orig_setMusicAllow) kp_orig_setMusicAllow(self, _cmd, v);
 }
 
+// 台下采集心跳计数（kp_hook_mixProc 在下方使用，需先声明）
+static _Atomic long g_usCapTicks = 0;
+
 static void kp_hook_mixProc(id self, SEL _cmd, int16_t *pcm, unsigned long long frames,
                             unsigned long long chs, double rate) {
     long n = ++g_mixProcCalls;
+
+    // v31.6 台下采集心跳：understage 开启时确认本地采集推流仍在跑（~250 次回调打一条）
+    if (g_understageEnabled) {
+        long c = ++g_usCapTicks;
+        if (c % 250 == 1) {
+            kp_log(@"[understage-diag] capture alive ticks=%ld understage=ON mixcalls=%ld", c, n);
+        }
+    }
 
     // v31.3：mixProcessedPCM: 是 KAKA 1.2.4 真实的每秒最终上行出口（probe-m + 日志实证），
     // 直接在这里接管处理（全链 DSP + BGM/音效混音 + tanhf 软限幅写入 pcm 缓冲区）
@@ -2382,12 +2393,26 @@ static void (*orig_us_setCapAllow)(id, SEL, BOOL) = NULL;
 static void (*orig_us_setMicMuted)(id, SEL, BOOL) = NULL;
 static void (*orig_us_setApmMuted)(id, SEL, BOOL) = NULL;
 
+// v31.6 台下状态诊断日志（节流打印，避免刷爆 rack.log）
+static double g_usLastLogTime = 0.0;
+
+static void kp_us_log_throttled(NSString *msg) {
+    double now = CACurrentMediaTime();
+    if (now - g_usLastLogTime >= 1.5) {
+        g_usLastLogTime = now;
+        kp_log(@"[understage-diag] %@", msg);
+    }
+}
+
 static BOOL kp_us_hook_capGate(id self, SEL _cmd) {
     if (g_understageEnabled) return NO;
     return orig_us_capGate ? orig_us_capGate(self, _cmd) : NO;
 }
 
 static void kp_us_hook_setCapGate(id self, SEL _cmd, BOOL en) {
+    if (en) {
+        kp_us_log_throttled([NSString stringWithFormat:@"拦截 setRoomCaptureGateEnabled:YES -> understage=%d", (int)g_understageEnabled]);
+    }
     BOOL target = g_understageEnabled ? NO : en;
     if (orig_us_setCapGate) orig_us_setCapGate(self, _cmd, target);
 }
@@ -2398,16 +2423,25 @@ static BOOL kp_us_hook_capAllow(id self, SEL _cmd) {
 }
 
 static void kp_us_hook_setCapAllow(id self, SEL _cmd, BOOL allow) {
+    if (!allow) {
+        kp_us_log_throttled([NSString stringWithFormat:@"拦截 setRoomCaptureDeliveryAllowed:NO -> understage=%d", (int)g_understageEnabled]);
+    }
     BOOL target = g_understageEnabled ? YES : allow;
     if (orig_us_setCapAllow) orig_us_setCapAllow(self, _cmd, target);
 }
 
 static void kp_us_hook_setMicMuted(id self, SEL _cmd, BOOL muted) {
+    if (muted) {
+        kp_us_log_throttled([NSString stringWithFormat:@"拦截 setMicrophoneMuted:YES -> understage=%d", (int)g_understageEnabled]);
+    }
     BOOL target = g_understageEnabled ? NO : muted;
     if (orig_us_setMicMuted) orig_us_setMicMuted(self, _cmd, target);
 }
 
 static void kp_us_hook_setApmMuted(id self, SEL _cmd, BOOL muted) {
+    if (muted) {
+        kp_us_log_throttled([NSString stringWithFormat:@"拦截 setMuted:YES -> understage=%d", (int)g_understageEnabled]);
+    }
     BOOL target = g_understageEnabled ? NO : muted;
     if (orig_us_setApmMuted) orig_us_setApmMuted(self, _cmd, target);
 }
