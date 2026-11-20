@@ -45,8 +45,11 @@ static _Atomic BOOL  g_lowCutEnabled     = YES;
 static _Atomic BOOL  g_throatEnabled     = YES;
 
 static _Atomic BOOL  g_compEnabled       = YES;
-static _Atomic float g_compThresh        = 0.30f;
-static _Atomic float g_compRatio         = 3.2f;
+static _Atomic float g_compThresh        = 0.08f;   // KVDSP：线性阈值约 -22dBFS，把每句话压紧
+static _Atomic float g_compRatio         = 4.5f;    // KVDSP：3人以上建议 4~6
+static _Atomic float g_preGain           = 1.80f;   // KVDSP：前级驱动增益
+static _Atomic BOOL  g_forceDefaultMode  = YES;     // 强制将 VoiceChat 改为 Default，甩掉苹果通话模式压制
+static _Atomic BOOL  g_disableDucking    = YES;     // 关闭系统/WebRTC 自动闪避
 
 static _Atomic BOOL  g_eq10Enabled       = YES;
 static const float kEq10Freqs[EQ10_BANDS] = {
@@ -127,7 +130,8 @@ static float g_compRelCoef         = 0.085f;
 static float g_compEnv[MAX_CHANNELS] = {0};
 static float g_grCompPeak          = 0.0f;
 static float g_grLimPeak           = 0.0f;
-static float g_rmsTrim             = 1.0f;
+static float g_kvEnv        = 0.0f;  // KVDSP 浮点出口压缩包络（KPCustomAudioProcessor 专用）
+static float g_kvGainSmooth = 1.0f;  // KVDSP 浮点出口平滑增益
 
 static void kp_log(NSString *fmt, ...);
 static void kp_rebuild_filter_bank(void);
@@ -174,13 +178,13 @@ static void load_saved_settings(void) {
         }
     }
 
-    if (g_makeupGain < 1.0f || g_makeupGain > 10.0f)                g_makeupGain = 1.50f;
+    if (g_makeupGain < 1.0f || g_makeupGain > 10.0f)                g_makeupGain = 2.20f;  // KVDSP 默认补偿增益
     if (g_limiterCeiling < 20000.0f || g_limiterCeiling > 32700.0f) g_limiterCeiling = 29800.0f;
-    if (g_compThresh < 0.08f || g_compThresh > 0.80f)               g_compThresh = 0.30f;
-    if (g_compRatio < 1.2f || g_compRatio > 10.0f)                  g_compRatio = 3.2f;
+    if (g_compThresh < 0.05f || g_compThresh > 0.80f)               g_compThresh = 0.08f;  // KVDSP 默认门限
+    if (g_compRatio < 1.2f || g_compRatio > 10.0f)                  g_compRatio = 4.5f;    // KVDSP 默认压缩比
+    if (g_bgmVolume < 0.0f || g_bgmVolume > 2.0f)                   g_bgmVolume = 0.45f;   // v31.1：上限放宽到 200%
     if (g_reverbRoom < 0.0f || g_reverbRoom > 0.95f)                g_reverbRoom = 0.85f;
     if (g_reverbWet < 0.0f || g_reverbWet > 0.80f)                  g_reverbWet = 0.25f;
-    if (g_bgmVolume < 0.0f || g_bgmVolume > 1.0f)                   g_bgmVolume = 0.45f;
     if (g_sfxVolume < 0.0f || g_sfxVolume > 1.0f)                   g_sfxVolume = 1.0f;
     if (g_bgmDuckFloor < 0.05f || g_bgmDuckFloor > 0.70f)           g_bgmDuckFloor = 0.22f;
 
@@ -343,12 +347,13 @@ static void kp_rebuild_filter_bank(void) {
     int next = 1 - g_activeBank;
     KPFilterBank *B = &g_filterBanks[next];
 
+    // 报告 10/12 节：2.8kHz +5dB 制造频段区隔，3人以上混音里让人耳先抓住你
     if (g_priorityLoud) {
-        kp_rbj_peaking(&B->throat[0], fs, 2200.0f, 1.10f, 3.8f);
-        kp_rbj_peaking(&B->throat[1], fs, 3400.0f, 1.15f, 4.0f);
+        kp_rbj_peaking(&B->throat[0], fs, 2800.0f, 1.15f, 5.0f);
+        kp_rbj_peaking(&B->throat[1], fs, 3600.0f, 1.30f, 2.5f);
     } else {
-        kp_rbj_peaking(&B->throat[0], fs, 220.0f,  1.20f, 2.0f);
-        kp_rbj_peaking(&B->throat[1], fs, 2800.0f, 1.30f, 2.5f);
+        kp_rbj_peaking(&B->throat[0], fs, 2800.0f, 1.20f, 3.0f);
+        kp_rbj_peaking(&B->throat[1], fs, 220.0f,  1.20f, 1.5f);
     }
 
     for (int i = 0; i < EQ10_BANDS; i++) {
@@ -356,13 +361,13 @@ static void kp_rebuild_filter_bank(void) {
         kp_rbj_peaking(&B->eq10[i], fs, kEq10Freqs[i], q, g_eq10Gains[i]);
     }
 
-    float fc = g_priorityLoud ? 100.0f : 80.0f;
+    // 120Hz 高通：去掉糊成一团的低频，把动态余量全留给中频
+    float fc = g_priorityLoud ? 120.0f : 90.0f;
     g_hpfAlpha = expf(-2.0f * (float)M_PI * fc / fs);
 
-    float atk = g_priorityLoud ? 0.0025f : 0.004f;
-    float rel = g_priorityLoud ? 0.085f  : 0.130f;
-    g_compAtkCoef = 1.0f - expf(-1.0f / (fs * atk));
-    g_compRelCoef = 1.0f - expf(-1.0f / (fs * rel));
+    // 报告 10 节压缩时间常数：Attack 5ms / Release 150ms
+    g_compAtkCoef = 1.0f - expf(-1.0f / (fs * 0.005f));
+    g_compRelCoef = 1.0f - expf(-1.0f / (fs * 0.150f));
 
     g_activeBank = next;
 }
@@ -1465,8 +1470,8 @@ static inline void kp_process_pcm(int16_t *pcm, UInt32 frames, UInt32 chs, BOOL 
                 vR = vR * (1.0f - g_reverbWet) + wR * g_reverbWet;
             }
 
-            vL *= gain * g_rmsTrim;
-            vR *= gain * g_rmsTrim;
+            vL *= gain;
+            vR *= gain;
 
             float mus = 0.0f;
             if (isPrimary) {
@@ -1530,20 +1535,9 @@ static inline void kp_process_pcm(int16_t *pcm, UInt32 frames, UInt32 chs, BOOL 
             }
         }
 
-        if (isPrimary && rmsCnt > 0) {
-            float rms = sqrtf(sumSq / (float)rmsCnt);
-            if (rms > 0.0001f) {
-                float tgt = g_priorityLoud ? 0.300f : 0.275f;
-                float want = tgt / rms;
-                if (want > 1.0f) want = 1.0f;
-                float coef = (want < g_rmsTrim) ? 0.12f : 0.005f;
-                g_rmsTrim += (want - g_rmsTrim) * coef;
-                if (g_rmsTrim < 0.20f) g_rmsTrim = 0.20f;
-                if (g_rmsTrim > 1.0f)  g_rmsTrim = 1.0f;
-            }
-            sumSq = 0.0f;
-            rmsCnt = 0;
-        }
+        // v31.1：g_rmsTrim 自压总增益机制已彻底移除——响度全部交给 KVDSP 浮点出口把控
+        sumSq = 0.0f;
+        rmsCnt = 0;
     }
 
     kp_probe_out(pcm, frames, chs, isPrimary);
@@ -1562,6 +1556,172 @@ static inline void kp_process_pcm(int16_t *pcm, UInt32 frames, UInt32 chs, BOOL 
     }
     g_frames++;
 }
+
+// ==========================================
+// 8a. 自定义浮点后处理：完全接管 WebRTC capturePostProcessingDelegate，跳过官方 KakaAudioMixer
+//     KVDSP 人声处理 + 独立音量 BGM/音效/话术混音 + tanhf 软限幅，恒在 ±1.0 内响而不炸
+// ==========================================
+@interface KPCustomAudioProcessor : NSObject
+- (void)audioProcessingInitializeWithSampleRate:(size_t)sampleRate channels:(size_t)channels;
+- (void)audioProcessingProcess:(id)audioBuffer;
+- (void)audioProcessingRelease;
+@end
+
+static KPCustomAudioProcessor *g_customProc = nil;
+
+@implementation KPCustomAudioProcessor
+
+- (void)audioProcessingInitializeWithSampleRate:(size_t)sampleRate channels:(size_t)channels {
+    if (sampleRate >= 8000 && sampleRate <= 96000) {
+        g_sampleRate = (float)sampleRate;
+        kp_rebuild_filter_bank();
+    }
+    g_kvEnv = 0.0f;
+    g_kvGainSmooth = 1.0f;
+    kp_log(@"[KV-TAKEOVER] 浮点出口已接管（跳过官方混音器）sr=%zu ch=%zu", sampleRate, channels);
+}
+
+- (void)audioProcessingProcess:(id)audioBuffer {
+    if (!g_dspEnabled || !audioBuffer) return;
+
+    // 通过 runtime 读取 RTCAudioBuffer 的 channels / frames / rawBufferForChannel:
+    NSUInteger chans  = ((NSUInteger (*)(id, SEL))objc_msgSend)(audioBuffer, NSSelectorFromString(@"channels"));
+    NSUInteger frames = ((NSUInteger (*)(id, SEL))objc_msgSend)(audioBuffer, NSSelectorFromString(@"frames"));
+    if (chans == 0 || frames == 0) return;
+    if (chans > 2) chans = 2;
+
+    float *bufs[2] = {NULL, NULL};
+    SEL rawSel = NSSelectorFromString(@"rawBufferForChannel:");
+    for (NSUInteger c = 0; c < chans; c++) {
+        bufs[c] = ((float *(*)(id, SEL, NSUInteger))objc_msgSend)(audioBuffer, rawSel, c);
+        if (!bufs[c]) return;
+    }
+
+    const KPFilterBank *bank = &g_filterBanks[g_activeBank];
+    float fs = g_sampleRate > 8000.0f ? g_sampleRate : 48000.0f;
+
+    // 1. 计算本帧原始峰值，用于 BGM 说话闪避检测
+    float rawPeak = 0.0f;
+    for (NSUInteger i = 0; i < frames; i++) {
+        float a = fabsf(bufs[0][i]);
+        if (a > rawPeak) rawPeak = a;
+    }
+
+    // 2. 平滑更新 BGM 闪避系数（关掉闪避则恒为 1.0，绝不压小）
+    BOOL clipOn = (g_clipOn != 0);
+    float floorV = (g_bgmDuckFloor >= 0.05f && g_bgmDuckFloor <= 0.70f) ? g_bgmDuckFloor : 0.22f;
+    float duckTarget = (g_duckEnabled && (rawPeak > 0.025f || clipOn)) ? floorV : 1.0f;
+    float dt  = (float)frames / fs;
+    float tau = (duckTarget < g_duckGain) ? 0.030f : 0.280f;
+    float aDuck = 1.0f - expf(-dt / tau);
+    if (aDuck > 1.0f) aDuck = 1.0f;
+    g_duckGain += (duckTarget - g_duckGain) * aDuck;
+
+    float outPeak = 0.0f;
+    float thr = g_compThresh;
+    float ratio = g_compRatio;
+    float preG = g_preGain;
+    float makeup = g_makeupGain;
+
+    for (NSUInteger f = 0; f < frames; f++) {
+        float tmp[2] = {0.0f, 0.0f};
+        float peak = 0.0f;
+
+        // 3. 人声链：120Hz 高通 -> 2.8kHz 存在感提亮 -> 10段 EQ -> 前级增益
+        for (NSUInteger c = 0; c < chans; c++) {
+            float x = bufs[c][f];
+            if (g_lowCutEnabled) {
+                float fy = x - g_dc_x1[c] + g_hpfAlpha * g_dc_y1[c];
+                g_dc_x1[c] = x;
+                g_dc_y1[c] = fy;
+                x = fy;
+            }
+            if (g_throatEnabled) {
+                x = kp_biquad_run(x, &bank->throat[0], &g_throatSt[c][0]);
+                x = kp_biquad_run(x, &bank->throat[1], &g_throatSt[c][1]);
+            }
+            if (g_eq10Enabled) {
+                for (int b = 0; b < EQ10_BANDS; b++) {
+                    x = kp_biquad_run(x, &bank->eq10[b], &g_eq10St[c][b]);
+                }
+            }
+            x *= preG;
+            tmp[c] = x;
+            float ax = fabsf(x);
+            if (ax > peak) peak = ax;
+        }
+
+        // 4. 紧致压缩器（报告附录 C.1 逻辑：4:1~6:1 压密人声）
+        float coef = (peak > g_kvEnv) ? g_compAtkCoef : g_compRelCoef;
+        g_kvEnv += (peak - g_kvEnv) * coef;
+        float targetGr = 1.0f;
+        if (g_compEnabled && g_kvEnv > thr && thr > 0.001f) {
+            float overDb = 20.0f * log10f(g_kvEnv / thr);
+            float redDb  = overDb * (1.0f - 1.0f / ratio);
+            targetGr = powf(10.0f, -redDb / 20.0f);
+        }
+        g_kvGainSmooth += (targetGr - g_kvGainSmooth) * 0.35f;
+
+        // 5. 提取 BGM / 音效 / 话术（独立推子，不再被 0.65f 砍一刀）
+        float mus = 0.0f;
+        for (int s = 0; s < SFX_SLOT; s++) {
+            if (!g_sfxOn[s]) continue;
+            int pos = g_sfxPos[s];
+            if (pos >= (int)g_sfxClip[s].len) { g_sfxOn[s] = 0; continue; }
+            mus += ((float)g_sfxClip[s].pcm[pos] / 32768.0f) * g_sfxVolume;
+            g_sfxPos[s] = pos + 1;
+        }
+        if (g_bgmOn && g_bgmPcm && g_bgmLen > 0) {
+            int pos = g_bgmPos;
+            if (pos >= g_bgmLen) pos = 0;
+            float duckF = g_duckEnabled ? g_duckGain : 1.0f;
+            mus += ((float)g_bgmPcm[pos] / 32768.0f) * g_bgmVolume * duckF;
+            g_bgmPos = pos + 1;
+        }
+        if (g_clipOn && g_clipPcm && g_clipLen > 0) {
+            int pos = g_clipPos;
+            if (pos >= g_clipLen && g_clipLoop) pos = 0;
+            if (pos < g_clipLen) {
+                mus += ((float)g_clipPcm[pos] / 32768.0f);
+                g_clipPos = pos + 1;
+            } else {
+                g_clipOn = 0;
+                g_clipPlayingSlot = -1;
+            }
+        }
+
+        // 6. 人声(压缩+Makeup) + BGM 汇总，过 tanhf 软限幅（恒在 ±1.0 内，响且不炸）
+        for (NSUInteger c = 0; c < chans; c++) {
+            float v = tmp[c] * g_kvGainSmooth * makeup;
+            if (g_reverbEnabled) {
+                float w = kp_reverb_tick(v * 32768.0f, (UInt32)c) / 32768.0f;
+                v = v * (1.0f - g_reverbWet) + w * g_reverbWet;
+            }
+            float out = tanhf(v + mus);
+            bufs[c][f] = out;
+            if (fabsf(out) > outPeak) outPeak = fabsf(out);
+        }
+
+        // 话术录音同步采集（录下处理后的人声）
+        if (g_recOn && g_recBuf && g_recCount < CLIP_MAX_SAMPLES) {
+            float rv = tanhf(tmp[0] * g_kvGainSmooth * makeup) * 32767.0f;
+            g_recBuf[g_recCount++] = (int16_t)rv;
+        }
+    }
+
+    int vuIn  = (int)(rawPeak * 100.0f); if (vuIn > 100)  vuIn = 100;
+    int vuOut = (int)(outPeak * 100.0f); if (vuOut > 100) vuOut = 100;
+    if (vuIn > g_vuIn)   g_vuIn = vuIn;
+    if (vuOut > g_vuOut) g_vuOut = vuOut;
+    if (vuOut > g_vuMic) g_vuMic = vuOut;
+    g_pcmCalls++;
+}
+
+- (void)audioProcessingRelease {
+    kp_log(@"[KV-TAKEOVER] 浮点出口已释放");
+}
+
+@end
 
 // ==========================================
 // 8. 音频与 WebRTC 安全 Hook 层
@@ -1613,9 +1773,11 @@ static void kp_hook_will_enable_engine(id self, SEL _cmd, id adm, BOOL eng, BOOL
 
 static int kp_deliver_pcm(id self, SEL _cmd, int16_t *pcm, unsigned int frames, unsigned long long channels, const AudioTimeStamp *ts) {
     g_pcmCalls++;
-    if (g_dspEnabled && pcm && frames > 0) {
-        kp_process_pcm(pcm, frames, (UInt32)channels, YES);
-    }
+    // v31.1：KVDSP 浮点出口（KPCustomAudioProcessor）已完全接管，
+    // int16 采集路径不再做 DSP，避免两遍增益叠加导致破音/冲突
+    // if (g_dspEnabled && pcm && frames > 0) {
+    //     kp_process_pcm(pcm, frames, (UInt32)channels, YES);
+    // }
     return orig_deliverPCM(self, _cmd, pcm, frames, channels, ts);
 }
 
@@ -1625,9 +1787,10 @@ static void kp_mixer_pcm(id self, SEL _cmd, int16_t *pcm, unsigned long long fra
         g_sampleRate = (float)rate;
         kp_rebuild_filter_bank();
     }
-    if (g_dspEnabled && (g_mixDspEnabled || g_losslessPriority) && pcm && frames > 0) {
-        kp_process_pcm(pcm, (UInt32)frames, (UInt32)channels, NO);
-    }
+    // v31.1：int16 混音路径不再做 DSP（统一在 KPCustomAudioProcessor 浮点出口处理）
+    // if (g_dspEnabled && (g_mixDspEnabled || g_losslessPriority) && pcm && frames > 0) {
+    //     kp_process_pcm(pcm, (UInt32)frames, (UInt32)channels, NO);
+    // }
     orig_mixerPCM(self, _cmd, pcm, frames, channels, rate);
 }
 
@@ -1716,15 +1879,113 @@ static BOOL kp_hook_av_setMode(id self, SEL _cmd, NSString *mode, NSError **err)
     return kp_orig_av_setMode ? kp_orig_av_setMode(self, _cmd, targetMode, err) : YES;
 }
 
+// v31.1：强行关闭 RTCAudioDeviceModule 的 Ducking 和平台 AGC
+static void kp_tune_device_module(id adm) {
+    if (!adm) return;
+    @try {
+        if (g_disableDucking) {
+            SEL sDuck = NSSelectorFromString(@"setAdvancedDuckingEnabled:");
+            if ([adm respondsToSelector:sDuck]) ((void (*)(id, SEL, BOOL))objc_msgSend)(adm, sDuck, NO);
+            SEL sLvl = NSSelectorFromString(@"setDuckingLevel:");
+            if ([adm respondsToSelector:sLvl]) ((void (*)(id, SEL, long))objc_msgSend)(adm, sLvl, 0);
+        }
+        SEL sAgc = NSSelectorFromString(@"setVoiceProcessingAGCEnabled:");
+        if ([adm respondsToSelector:sAgc]) ((void (*)(id, SEL, BOOL))objc_msgSend)(adm, sAgc, NO);
+    } @catch (NSException *e) {}
+}
+
+// v31.1：强行关闭 APM 的 AGC1/AGC2/NS/HPF/瞬态抑制（保留 AEC 防外放啸叫）
+static void kp_tune_apm_config(id cfg) {
+    if (!cfg) return;
+    @try {
+        [cfg setValue:@NO forKey:@"isAutoGainControl1Enabled"];
+        [cfg setValue:@NO forKey:@"isAutoGainControl2Enabled"];
+        [cfg setValue:@NO forKey:@"isNoiseSuppressionEnabled"];
+        [cfg setValue:@NO forKey:@"isTransientSuppressionEnabled"];
+        [cfg setValue:@NO forKey:@"isHighPassFilterEnabled"];
+        // AEC 保持 YES，避免外放啸叫
+    } @catch (NSException *e) {}
+}
+
+// v31.1：Hook AVAudioSession / RTCAudioSession 的 setCategory:mode:options:error:
+//        把 VoiceChat / VideoChat 全部改写为 Default，甩掉苹果通话模式压制
+static BOOL (*orig_av_setCatModeOpt)(id, SEL, NSString *, NSString *, NSUInteger, NSError **) = NULL;
+static BOOL kp_hook_av_setCatModeOpt(id self, SEL _cmd, NSString *cat, NSString *mode, NSUInteger opt, NSError **err) {
+    NSString *m = mode;
+    if (g_forceDefaultMode && ([m isEqualToString:@"AVAudioSessionModeVoiceChat"] || [m isEqualToString:@"AVAudioSessionModeVideoChat"])) {
+        m = @"AVAudioSessionModeDefault";
+    }
+    return orig_av_setCatModeOpt ? orig_av_setCatModeOpt(self, _cmd, cat, m, opt, err) : YES;
+}
+
 static void kp_disable_agc(void) {
+    if (!g_customProc) g_customProc = [[KPCustomAudioProcessor alloc] init];
+
+    // ① Hook AVAudioSession / RTCAudioSession：切掉 VoiceChat 语音处理链
+    for (NSString *clsName in @[@"AVAudioSession", @"RTCAudioSession"]) {
+        Class cls = objc_getClass(clsName.UTF8String);
+        if (!cls) continue;
+        SEL sel = @selector(setCategory:mode:options:error:);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m && !orig_av_setCatModeOpt) {
+            orig_av_setCatModeOpt = (BOOL (*)(id, SEL, NSString *, NSString *, NSUInteger, NSError **))method_getImplementation(m);
+            method_setImplementation(m, (IMP)kp_hook_av_setCatModeOpt);
+        }
+    }
+
+    // ② Hook RTCDefaultAudioProcessingModule：关 AGC/NS/HPF，并用 g_customProc 完全顶掉官方 KakaAudioMixer
+    Class apmCls = objc_getClass("RTCDefaultAudioProcessingModule");
+    if (apmCls) {
+        SEL initSel = NSSelectorFromString(@"initWithConfig:capturePostProcessingDelegate:renderPreProcessingDelegate:");
+        Method mInit = class_getInstanceMethod(apmCls, initSel);
+        if (mInit) {
+            IMP origInit = method_getImplementation(mInit);
+            method_setImplementation(mInit, imp_implementationWithBlock(^id(id _s, id cfg, id capDel, id renDel) {
+                kp_tune_apm_config(cfg);
+                // 直接传 g_customProc，不再挂官方 capDel (KakaAudioMixer)
+                return ((id (*)(id, SEL, id, id, id))origInit)(_s, initSel, cfg, g_customProc, renDel);
+            }));
+        }
+        SEL setCfgSel = NSSelectorFromString(@"setConfig:");
+        Method mCfg = class_getInstanceMethod(apmCls, setCfgSel);
+        if (mCfg) {
+            IMP origCfg = method_getImplementation(mCfg);
+            method_setImplementation(mCfg, imp_implementationWithBlock(^(id _s, id cfg) {
+                kp_tune_apm_config(cfg);
+                ((void (*)(id, SEL, id))origCfg)(_s, setCfgSel, cfg);
+            }));
+        }
+        SEL setDelSel = NSSelectorFromString(@"setCapturePostProcessingDelegate:");
+        Method mDel = class_getInstanceMethod(apmCls, setDelSel);
+        if (mDel) {
+            IMP origDel = method_getImplementation(mDel);
+            method_setImplementation(mDel, imp_implementationWithBlock(^(id _s, id del) {
+                // 无论 App 试图把 KakaAudioMixer 设成什么，都强行换成我们的 g_customProc
+                ((void (*)(id, SEL, id))origDel)(_s, setDelSel, g_customProc);
+            }));
+        }
+    }
+
+    // ③ Hook RTCAudioDeviceModule：关 advancedDuckingEnabled 和 duckingLevel
     Class adm = objc_getClass("RTCAudioDeviceModule");
     if (adm) {
+        SEL initAdm = NSSelectorFromString(@"initWithNativeModule:workerThread:audioDeviceModuleType:");
+        Method mAdm = class_getInstanceMethod(adm, initAdm);
+        if (mAdm) {
+            IMP origAdm = method_getImplementation(mAdm);
+            method_setImplementation(mAdm, imp_implementationWithBlock(^id(id _s, void *nm, void *wt, NSInteger t) {
+                id obj = ((id (*)(id, SEL, void *, void *, NSInteger))origAdm)(_s, initAdm, nm, wt, t);
+                kp_tune_device_module(obj);
+                return obj;
+            }));
+        }
         Method m1 = class_getInstanceMethod(adm, @selector(setVoiceProcessingAGCEnabled:));
         if (m1) method_setImplementation(m1, imp_implementationWithBlock(^(id _s, BOOL en) { (void)en; }));
         Method m2 = class_getInstanceMethod(adm, @selector(isVoiceProcessingAGCEnabled));
         if (m2) method_setImplementation(m2, imp_implementationWithBlock(^(id _s) { return NO; }));
     }
 
+    // ④ RTCAudioProcessingConfig 兜底锁（v31 原有）：AGC1/2/NS/TS/HPF 全部锁 NO，AEC 按模式放行
     Class cfg = objc_getClass("RTCAudioProcessingConfig");
     if (cfg) {
         kp_lock_bool_prop(cfg, @"isAutoGainControl1Enabled", @"setIsAutoGainControl1Enabled:");
@@ -1751,6 +2012,7 @@ static void kp_disable_agc(void) {
         }
     }
 
+    // ⑤ AVAudioSession setMode 兜底改写（v31 原有）
     Class avs = objc_getClass("AVAudioSession");
     if (avs) {
         Method m = class_getInstanceMethod(avs, @selector(setMode:error:));
@@ -1760,6 +2022,7 @@ static void kp_disable_agc(void) {
         }
     }
 
+    // ⑥ AVAudioInputNode 平台 AGC 锁（v31 原有）
     Class ion = objc_getClass("AVAudioInputNode");
     if (ion) {
         Method m1 = class_getInstanceMethod(ion, @selector(setVoiceProcessingAGCEnabled:));
@@ -2470,12 +2733,12 @@ static void kp_toggle_master_lock(BOOL lock) {
         g_lowCutEnabled    = YES;
         g_throatEnabled    = YES;
         g_compEnabled      = YES;
-        g_compThresh       = 0.30f;
-        g_compRatio        = 3.2f;
+        g_compThresh       = 0.08f;
+        g_compRatio        = 4.5f;
         g_eq10Enabled      = YES;
         g_limiterEnabled   = YES;
         g_limiterCeiling   = 29800.0f;
-        g_makeupGain       = 1.50f;
+        g_makeupGain       = 2.20f;
         g_shieldRemote     = YES;
         g_shieldLowOnly    = YES;
         kp_shield_apply();
@@ -2841,7 +3104,7 @@ static void kp_build_sound_page(CGFloat w) {
 
     UILabel *bgmVolText = kp_label(CGRectMake(16, 268, 260, 16), [NSString stringWithFormat:@"伴奏音量 %.0f%%", (double)(g_bgmVolume * 100)], 10, [UIColor colorWithWhite:0.62 alpha:1.0], NO);
     [g_pageSound addSubview:bgmVolText];
-    [g_pageSound addSubview:kp_slider(CGRectMake(16, 284, w - 32, 18), 0.0f, 1.0f, g_bgmVolume, ^(float v) {
+    [g_pageSound addSubview:kp_slider(CGRectMake(16, 284, w - 32, 18), 0.0f, 2.0f, g_bgmVolume, ^(float v) {
         g_bgmVolume = v; bgmVolText.text = [NSString stringWithFormat:@"伴奏音量 %.0f%%", (double)(v * 100)]; save_current_settings();
     })];
 
@@ -3148,7 +3411,9 @@ __attribute__((constructor)) static void kp_entry(void) {
     kp_lic_load();
     kp_disable_agc();
     kp_eq_init();
-    kp_setup_sdp_hook();
+    // v31.1：官方 SDP 已带 stereo=1;sprop-stereo=1;maxaveragebitrate=（报告 2.3 节证实），
+    // 放行官方 SDP 即可，不再自行改写（避免与网关对抗触发重协商）
+    // kp_setup_sdp_hook();
     kp_setup_sender_hook();
     kp_setup_shield_hook();
     kp_setup_kaka_allow_hooks();
