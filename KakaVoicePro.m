@@ -2323,14 +2323,18 @@ static void kp_hook_mixProc(id self, SEL _cmd, int16_t *pcm, unsigned long long 
     long n = ++g_mixProcCalls;
 
     // v31.3：mixProcessedPCM: 是 KAKA 1.2.4 真实的每秒最终上行出口（probe-m + 日志实证），
-    // 直接在这里接管处理，不再调用官方 orig_mixProc（彻底跳过官方混音衰减）
+    // 直接在这里接管处理（全链 DSP + BGM/音效混音 + tanhf 软限幅写入 pcm 缓冲区）
     if (g_dspEnabled && pcm && frames > 0) {
         if (rate >= 8000.0 && rate <= 96000.0 && fabsf((float)rate - g_sampleRate) > 10.0f) {
             g_sampleRate = (float)rate;
             kp_rebuild_filter_bank();
         }
         kp_process_pcm(pcm, (UInt32)frames, (UInt32)(chs > 0 ? chs : 1), YES);
-    } else if (kp_orig_mixProc) {
+    }
+
+    // v31.4：处理完之后放行给原方法，恢复本地耳返监听（_monitor/_musicMonitor 路由）
+    // 满血音频既发给全房，也回放到自己耳机；对端响度不受影响
+    if (kp_orig_mixProc) {
         kp_orig_mixProc(self, _cmd, pcm, frames, chs, rate);
     }
 
