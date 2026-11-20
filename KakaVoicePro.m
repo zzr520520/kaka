@@ -1846,6 +1846,38 @@ static int kp_install_hooks(void) {
             orig_willEnableEngine = (void (*)(id, SEL, id, BOOL, BOOL, BOOL, BOOL))method_getImplementation(me);
             method_setImplementation(me, (IMP)kp_hook_will_enable_engine);
         }
+
+        // v31.2 直接接管 KakaAudioMixer 的浮点出口，不调用原实现（彻底不要官方混音器）
+        // probe-m 已证实该类自带 audioProcessingInitializeWithSampleRate:channels: 与
+        // audioProcessingProcess:，原地替换即可命中真实调用链，无需依赖 APM 设代理
+        if (!g_customProc) g_customProc = [[KPCustomAudioProcessor alloc] init];
+
+        SEL initProcSel = NSSelectorFromString(@"audioProcessingInitializeWithSampleRate:channels:");
+        Method mInitProc = class_getInstanceMethod(mixer, initProcSel);
+        if (mInitProc) {
+            static BOOL hookedInit = NO;
+            if (!hookedInit) {
+                hookedInit = YES;
+                method_setImplementation(mInitProc, imp_implementationWithBlock(^(id _s, size_t sr, size_t ch) {
+                    [g_customProc audioProcessingInitializeWithSampleRate:sr channels:ch];
+                }));
+            }
+        }
+
+        SEL procSel = NSSelectorFromString(@"audioProcessingProcess:");
+        Method mProc = class_getInstanceMethod(mixer, procSel);
+        if (mProc) {
+            static BOOL hookedProc = NO;
+            if (!hookedProc) {
+                hookedProc = YES;
+                method_setImplementation(mProc, imp_implementationWithBlock(^(id _s, id audioBuffer) {
+                    // 直接跑我们自己的高密度人声 + BGM + tanhf 软限幅，不调官方 orig
+                    [g_customProc audioProcessingProcess:audioBuffer];
+                }));
+                state |= 8;
+                kp_log(@"[KV-TAKEOVER] 已强制原地接管 KakaAudioMixer audioProcessingProcess:");
+            }
+        }
     }
     return state;
 }
