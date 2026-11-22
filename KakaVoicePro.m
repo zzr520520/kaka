@@ -45,9 +45,9 @@ static _Atomic BOOL  g_lowCutEnabled     = YES;
 static _Atomic BOOL  g_throatEnabled     = YES;
 
 static _Atomic BOOL  g_compEnabled       = YES;
-static _Atomic float g_compThresh        = 0.14f;   // KVDSP：线性阈值约 -17dBFS，保留字头爆发力（v31.8）
-static _Atomic float g_compRatio         = 3.5f;    // KVDSP：3.5:1 适度压密，连续而不成死方波
-static _Atomic float g_preGain           = 1.35f;   // KVDSP：前级驱动增益（v31.8：原 1.80f 易顶爆）
+static _Atomic float g_compThresh        = 0.15f;   // v33：压缩阈值（约 -16.5dBFS），保留字头瞬态爆发力
+static _Atomic float g_compRatio         = 3.2f;    // v33：3.2:1 紧致压缩，字句连贯又不成方波
+static _Atomic float g_preGain           = 1.40f;   // v33：适度前级驱动（告别 1.80f 过载死砖墙）
 static _Atomic BOOL  g_forceDefaultMode  = YES;     // 强制将 VoiceChat 改为 Default，甩掉苹果通话模式压制
 static _Atomic BOOL  g_disableDucking    = YES;     // 关闭系统/WebRTC 自动闪避
 static _Atomic BOOL  g_understageEnabled = NO;      // 台下开麦：强开采集投递 + 强解本地静音（默认关，防热麦）
@@ -65,7 +65,7 @@ static _Atomic float g_reverbRoom        = 0.85f;
 static _Atomic float g_reverbWet         = 0.25f;
 
 static _Atomic BOOL  g_limiterEnabled    = YES;
-static _Atomic float g_makeupGain        = 1.65f;   // v31.8：回调补偿增益，说话 RMS 稳在 -10dB 黄金穿透区
+static _Atomic float g_makeupGain        = 1.55f;   // v33：补偿增益，目标说话 RMS 稳在 -10.5dB 左右
 static _Atomic float g_limiterCeiling    = 29800.0f; // 留出余量，避免混音阶段硬顶 100% 变方波
 
 static _Atomic BOOL  g_mixDspEnabled     = YES;
@@ -123,10 +123,17 @@ static _Atomic int  g_hookState = 0;
 #define KEY_PRIORITY_LOUD   @"kaka_v31_priority_loud"
 #define KEY_CLIP_LOOP       @"kaka_v31_clip_loop"
 #define KEY_UNDERSTAGE_ON   @"kaka_v31_understage_on"
+#define KEY_NOISE_GATE_ON   @"kaka_v33_gate_on"
 
 static float g_dc_x1[MAX_CHANNELS] = {0};
 static float g_dc_y1[MAX_CHANNELS] = {0};
 static float g_hpfAlpha            = 0.9870f;
+// v33：智能平滑噪声门（2ms 快开不吃字头 / 120ms 平滑关保留尾音，静音衰减至 2%）
+static float g_gateEnv[MAX_CHANNELS] = {0};
+static float g_gateAtkCoef          = 0.5f;
+static float g_gateRelCoef          = 0.05f;
+static _Atomic float g_gateThresh   = 0.015f;   // 噪声门阈值（约 -36.5dBFS）
+static _Atomic BOOL  g_noiseGateEnabled = YES;  // 噪声门总开关
 static float g_compAtkCoef         = 0.0025f;
 static float g_compRelCoef         = 0.085f;
 static float g_compEnv[MAX_CHANNELS] = {0};
@@ -170,6 +177,7 @@ static void load_saved_settings(void) {
     if ([ud objectForKey:KEY_PRIORITY_LOUD]) g_priorityLoud     = [ud boolForKey:KEY_PRIORITY_LOUD];
     if ([ud objectForKey:KEY_CLIP_LOOP])     g_clipLoop         = [ud boolForKey:KEY_CLIP_LOOP];
     if ([ud objectForKey:KEY_UNDERSTAGE_ON]) g_understageEnabled = [ud boolForKey:KEY_UNDERSTAGE_ON];
+    if ([ud objectForKey:KEY_NOISE_GATE_ON]) g_noiseGateEnabled = [ud boolForKey:KEY_NOISE_GATE_ON];
 
     NSArray *eqArr = [ud arrayForKey:KEY_EQ10_GAINS];
     if (eqArr.count == EQ10_BANDS) {
@@ -181,10 +189,10 @@ static void load_saved_settings(void) {
         }
     }
 
-    if (g_makeupGain < 1.0f || g_makeupGain > 10.0f)                g_makeupGain = 1.65f;  // v31.8：-10dB 黄金穿透区默认
+    if (g_makeupGain < 1.0f || g_makeupGain > 10.0f)                g_makeupGain = 1.55f;  // v33：-10.5dB 黄金区默认
     if (g_limiterCeiling < 20000.0f || g_limiterCeiling > 32700.0f) g_limiterCeiling = 29800.0f;
-    if (g_compThresh < 0.05f || g_compThresh > 0.80f)               g_compThresh = 0.14f;  // v31.8 默认门限
-    if (g_compRatio < 1.2f || g_compRatio > 10.0f)                  g_compRatio = 3.5f;    // v31.8 默认压缩比
+    if (g_compThresh < 0.05f || g_compThresh > 0.80f)               g_compThresh = 0.15f;  // v33 默认门限
+    if (g_compRatio < 1.2f || g_compRatio > 10.0f)                  g_compRatio = 3.2f;    // v33 默认压缩比
     if (g_bgmVolume < 0.0f || g_bgmVolume > 2.0f)                   g_bgmVolume = 0.45f;   // v31.1：上限放宽到 200%
     if (g_reverbRoom < 0.0f || g_reverbRoom > 0.95f)                g_reverbRoom = 0.85f;
     if (g_reverbWet < 0.0f || g_reverbWet > 0.80f)                  g_reverbWet = 0.25f;
@@ -222,6 +230,7 @@ static void save_current_settings(void) {
     [ud setBool:g_priorityLoud     forKey:KEY_PRIORITY_LOUD];
     [ud setBool:g_clipLoop         forKey:KEY_CLIP_LOOP];
     [ud setBool:g_understageEnabled forKey:KEY_UNDERSTAGE_ON];
+    [ud setBool:g_noiseGateEnabled forKey:KEY_NOISE_GATE_ON];
 
     NSMutableArray *eqArr = [NSMutableArray arrayWithCapacity:EQ10_BANDS];
     for (int i = 0; i < EQ10_BANDS; i++) {
@@ -372,14 +381,17 @@ static void kp_rebuild_filter_bank(void) {
     g_hpfAlpha = expf(-2.0f * (float)M_PI * fc / fs);
 
     // 报告 10 节压缩时间常数：Attack 5ms / Release 150ms
-    g_compAtkCoef = 1.0f - expf(-1.0f / (fs * 0.005f));
-    g_compRelCoef = 1.0f - expf(-1.0f / (fs * 0.150f));
+    g_compAtkCoef = 1.0f - expf(-1.0f / (fs * 0.016f)); // v33 慢启动：放过字头 16ms 瞬态爆发力
+    g_compRelCoef = 1.0f - expf(-1.0f / (fs * 0.140f)); // v33：Release 140ms 托住句尾
+    g_gateAtkCoef = 1.0f - expf(-1.0f / (fs * 0.002f)); // v33 噪声门：2ms 快开
+    g_gateRelCoef = 1.0f - expf(-1.0f / (fs * 0.120f)); // v33 噪声门：120ms 平滑关
 
     g_activeBank = next;
 }
 
 static void kp_eq_init(void) {
     memset(g_throatSt, 0, sizeof(g_throatSt));
+    memset(g_gateEnv, 0, sizeof(g_gateEnv));
     memset(g_eq10St, 0, sizeof(g_eq10St));
     kp_rebuild_filter_bank();
     kp_rebuild_filter_bank();
@@ -462,6 +474,14 @@ static inline float kp_voice_pre_sample(float inSample, UInt32 ch, const KPFilte
     }
 
     float xn = y * (1.0f / 32768.0f);
+    // v33 智能平滑噪声门：不说话时衰减至 2%（-34dB），把码率和动态全留给开口瞬间
+    if (g_noiseGateEnabled) {
+        float absX = fabsf(xn);
+        float tgt  = (absX >= g_gateThresh) ? 1.0f : 0.02f;
+        float gc   = (tgt > g_gateEnv[ch]) ? g_gateAtkCoef : g_gateRelCoef;
+        g_gateEnv[ch] += (tgt - g_gateEnv[ch]) * gc;
+        xn *= g_gateEnv[ch];
+    }
     if (g_throatEnabled) {
         xn = kp_biquad_run(xn, &bank->throat[0], &g_throatSt[ch][0]);
         xn = kp_biquad_run(xn, &bank->throat[1], &g_throatSt[ch][1]);
@@ -3184,12 +3204,12 @@ static void kp_toggle_master_lock(BOOL lock) {
         g_lowCutEnabled    = YES;
         g_throatEnabled    = YES;
         g_compEnabled      = YES;
-        g_compThresh       = 0.14f;
-        g_compRatio        = 3.5f;
+        g_compThresh       = 0.15f;
+        g_compRatio        = 3.2f;
         g_eq10Enabled      = YES;
         g_limiterEnabled   = YES;
         g_limiterCeiling   = 29800.0f;
-        g_makeupGain       = 1.65f;
+        g_makeupGain       = 1.55f;
         g_shieldRemote     = YES;
         g_shieldLowOnly    = YES;
         kp_shield_apply();
@@ -3332,11 +3352,11 @@ static void kp_build_rack_page(CGFloat w) {
     UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, KP_PAGE_Y, w, KP_PAGE_H)];
     sv.showsVerticalScrollIndicator = YES;
     sv.alwaysBounceVertical = YES;
-    sv.contentSize = CGSizeMake(w, 740);
+    sv.contentSize = CGSizeMake(w, 770);
     [g_panel addSubview:sv];
     g_pageRack = sv;
 
-    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 740)];
+    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 770)];
     [sv addSubview:c];
 
     UIColor *dim = [UIColor colorWithWhite:0.60 alpha:1.0];
@@ -3398,6 +3418,12 @@ static void kp_build_rack_page(CGFloat w) {
     kp_row_switch(c, y, w, @"房间与通道监听日志", g_roomMonitorEnabled, ^(BOOL on) {
         g_roomMonitorEnabled = on;
         kp_log(@"[ROOM-MON] 监听开关=%s", on ? "ON" : "OFF");
+    });
+    y += 30;
+    kp_row_switch(c, y, w, @"智能噪声门（静音省码率/防底噪占道）", g_noiseGateEnabled, ^(BOOL on) {
+        g_noiseGateEnabled = on;
+        save_current_settings();
+        kp_log(@"[gate] state=%s", on ? "ON" : "OFF");
     });
     y += 30;
     kp_row_switch(c, y, w, @"屏蔽他人声音（远端护盾）", g_shieldRemote, ^(BOOL on) { g_shieldRemote = on; kp_shield_apply(); save_current_settings(); });
