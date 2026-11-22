@@ -1730,6 +1730,81 @@ static KPCustomAudioProcessor *g_customProc = nil;
 @end
 
 // ==========================================
+// v31.9 房间与通道监听：下行混音统计（链式透传，不影响收听）
+// ==========================================
+static _Atomic BOOL g_roomMonitorEnabled = YES; // 房间与通道监听日志总开关
+static __weak id g_activePeerConn = nil;        // 当前活跃的 RTCPeerConnection
+static id g_origRenderDel = nil;                // 链式保留官方渲染代理，绝不影响听别人说话
+
+@interface KPRenderMonitorProcessor : NSObject
+- (void)audioProcessingInitializeWithSampleRate:(size_t)sampleRate channels:(size_t)channels;
+- (void)audioProcessingProcess:(id)audioBuffer;
+- (void)audioProcessingRelease;
+@end
+
+static KPRenderMonitorProcessor *g_renderMon = nil;
+
+@implementation KPRenderMonitorProcessor
+
+- (void)audioProcessingInitializeWithSampleRate:(size_t)sampleRate channels:(size_t)channels {
+    if (g_origRenderDel && [g_origRenderDel respondsToSelector:_cmd]) {
+        ((void (*)(id, SEL, size_t, size_t))objc_msgSend)(g_origRenderDel, _cmd, sampleRate, channels);
+    }
+    if (g_roomMonitorEnabled) {
+        kp_log(@"[ROOM-RX] 下行混音初始化 sr=%zu ch=%zu", sampleRate, channels);
+    }
+}
+
+- (void)audioProcessingProcess:(id)audioBuffer {
+    // 1. 统计整个房间下行混音的峰值和 RMS（不改数据，只监听）
+    if (g_roomMonitorEnabled && audioBuffer) {
+        NSUInteger chans  = ((NSUInteger (*)(id, SEL))objc_msgSend)(audioBuffer, NSSelectorFromString(@"channels"));
+        NSUInteger frames = ((NSUInteger (*)(id, SEL))objc_msgSend)(audioBuffer, NSSelectorFromString(@"frames"));
+        if (chans > 0 && frames > 0) {
+            float *p = ((float *(*)(id, SEL, NSUInteger))objc_msgSend)(audioBuffer, NSSelectorFromString(@"rawBufferForChannel:"), 0);
+            if (p) {
+                static double lastT = 0;
+                static float rxPeak = 0.0f;
+                static double sumSq = 0.0;
+                static long totalSamples = 0;
+
+                for (NSUInteger i = 0; i < frames; i++) {
+                    float v = p[i];
+                    float a = fabsf(v);
+                    if (a > rxPeak) rxPeak = a;
+                    sumSq += (double)v * (double)v;
+                }
+                totalSamples += (long)frames;
+
+                double now = CACurrentMediaTime();
+                if (lastT == 0) lastT = now;
+                if (now - lastT >= 5.0) {
+                    double rms = (totalSamples > 0) ? sqrt(sumSq / (double)totalSamples) : 0.0;
+                    double db  = 20.0 * log10(rms > 1e-9 ? rms : 1e-9);
+                    int pkPct  = (int)(rxPeak * 100.0f);
+                    if (pkPct > 100) pkPct = 100;
+                    kp_log(@"[ROOM-RX] 房间下行总音量 peak=%d%% rms=%.1fdB ch=%lu", pkPct, db, (unsigned long)chans);
+                    lastT = now; rxPeak = 0.0f; sumSq = 0.0; totalSamples = 0;
+                }
+            }
+        }
+    }
+
+    // 2. 原样交给官方渲染代理（确保听别人说话完全正常）
+    if (g_origRenderDel && [g_origRenderDel respondsToSelector:_cmd]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(g_origRenderDel, _cmd, audioBuffer);
+    }
+}
+
+- (void)audioProcessingRelease {
+    if (g_origRenderDel && [g_origRenderDel respondsToSelector:_cmd]) {
+        ((void (*)(id, SEL))objc_msgSend)(g_origRenderDel, _cmd);
+    }
+}
+
+@end
+
+// ==========================================
 // 8. 音频与 WebRTC 安全 Hook 层
 // ==========================================
 static int  (*orig_deliverPCM)(id, SEL, int16_t *, unsigned int, unsigned long long, const AudioTimeStamp *) = NULL;
@@ -1992,8 +2067,11 @@ static void kp_disable_agc(void) {
             IMP origInit = method_getImplementation(mInit);
             method_setImplementation(mInit, imp_implementationWithBlock(^id(id _s, id cfg, id capDel, id renDel) {
                 kp_tune_apm_config(cfg);
+                // v31.9：链式保留官方渲染代理，改传 g_renderMon 做下行统计（不影响收听）
+                if (renDel && renDel != (id)g_renderMon) g_origRenderDel = renDel;
+                if (!g_renderMon) g_renderMon = [[KPRenderMonitorProcessor alloc] init];
                 // 直接传 g_customProc，不再挂官方 capDel (KakaAudioMixer)
-                return ((id (*)(id, SEL, id, id, id))origInit)(_s, initSel, cfg, g_customProc, renDel);
+                return ((id (*)(id, SEL, id, id, id))origInit)(_s, initSel, cfg, g_customProc, g_renderMon);
             }));
         }
         SEL setCfgSel = NSSelectorFromString(@"setConfig:");
@@ -2570,6 +2648,143 @@ static void kp_setup_ws_unmute_hook(void) {
 }
 
 // ==========================================
+// v31.9 三路监听：WebRTC 通道统计 + WebSocket 下行信令 + 挂载器
+// ==========================================
+
+// 定时拉取 WebRTC 底层统计：上行/下行包数、丢包、抖动、audioLevel
+static void kp_poll_rtc_stats(void) {
+    if (!g_roomMonitorEnabled || !g_activePeerConn) return;
+    id pc = g_activePeerConn;
+    SEL statSel = NSSelectorFromString(@"statisticsWithCompletionHandler:");
+    if (![pc respondsToSelector:statSel]) return;
+
+    @try {
+        void (^cb)(id) = ^(id report) {
+            if (!report) return;
+            @try {
+                NSDictionary *stats = [report valueForKey:@"statistics"];
+                if (![stats isKindOfClass:[NSDictionary class]]) return;
+
+                NSMutableString *line = [NSMutableString stringWithString:@"[RTC-STATS] "];
+                BOOL hasInfo = NO;
+
+                for (id key in stats) {
+                    id st = stats[key];
+                    NSString *type = [st valueForKey:@"type"];
+                    NSDictionary *vals = [st valueForKey:@"values"];
+                    if (![vals isKindOfClass:[NSDictionary class]]) continue;
+
+                    if ([type isEqualToString:@"outbound-rtp"]) {
+                        [line appendFormat:@"TX(pkts=%@ bytes=%@) ",
+                         vals[@"packetsSent"] ?: @"0", vals[@"bytesSent"] ?: @"0"];
+                        hasInfo = YES;
+                    } else if ([type isEqualToString:@"media-source"]) {
+                        if (vals[@"audioLevel"]) {
+                            double lvl = [vals[@"audioLevel"] doubleValue];
+                            [line appendFormat:@"MIC-LVL=%.0f%% ", lvl * 100.0];
+                            hasInfo = YES;
+                        }
+                    } else if ([type isEqualToString:@"inbound-rtp"]) {
+                        double lvl = vals[@"audioLevel"] ? [vals[@"audioLevel"] doubleValue] : 0.0;
+                        [line appendFormat:@"RX(pkts=%@ lost=%@ jitter=%@ lvl=%.0f%%) ",
+                         vals[@"packetsReceived"] ?: @"0",
+                         vals[@"packetsLost"] ?: @"0",
+                         vals[@"jitter"] ?: @"0",
+                         lvl * 100.0];
+                        hasInfo = YES;
+                    }
+                }
+                if (hasInfo) kp_log(@"%@", line);
+            } @catch (NSException *e) {}
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(pc, statSel, cb);
+    } @catch (NSException *e) {}
+}
+
+// 拦截 WebSocket 收包：打印 Janus 房间号、成员列表、谁在说话、谁被静音
+static void (*orig_ws_recvMsg)(id, SEL, void (^)(NSURLSessionWebSocketMessage *, NSError *)) = NULL;
+static void kp_hook_ws_recvMsg(id self, SEL _cmd, void (^completionHandler)(NSURLSessionWebSocketMessage *, NSError *)) {
+    void (^wrapped)(NSURLSessionWebSocketMessage *, NSError *) = ^(NSURLSessionWebSocketMessage *msg, NSError *err) {
+        if (g_roomMonitorEnabled && !err && msg && msg.type == NSURLSessionWebSocketMessageTypeString && msg.string.length > 0) {
+            NSString *s = msg.string;
+            // 只抓取房间事件、成员、说话状态、静音、音量相关消息，过滤心跳
+            if ([s containsString:@"audiobridge"] || [s containsString:@"participants"] ||
+                [s containsString:@"talking"] || [s containsString:@"muted"] || [s containsString:@"volume"]) {
+                NSString *clip = s.length > 360 ? [[s substringToIndex:360] stringByAppendingString:@"..."] : s;
+                kp_log(@"[ROOM-WS-RX] %@", clip);
+            }
+        }
+        if (completionHandler) completionHandler(msg, err);
+    };
+    if (orig_ws_recvMsg) orig_ws_recvMsg(self, _cmd, wrapped);
+}
+
+static void kp_setup_room_monitor_hooks(void) {
+    if (!g_renderMon) g_renderMon = [[KPRenderMonitorProcessor alloc] init];
+
+    // 1. 挂载房间下行混音监听（链式不破坏官方播放）
+    Class apmCls = objc_getClass("RTCDefaultAudioProcessingModule");
+    if (apmCls) {
+        SEL setRenSel = NSSelectorFromString(@"setRenderPreProcessingDelegate:");
+        Method mRen = class_getInstanceMethod(apmCls, setRenSel);
+        if (mRen) {
+            static BOOL hookedRen = NO;
+            if (!hookedRen) {
+                hookedRen = YES;
+                IMP origRen = method_getImplementation(mRen);
+                method_setImplementation(mRen, imp_implementationWithBlock(^(id _s, id del) {
+                    if (del && del != (id)g_renderMon) g_origRenderDel = del;
+                    ((void (*)(id, SEL, id))origRen)(_s, setRenSel, g_renderMon);
+                }));
+            }
+        }
+    }
+
+    // 2. 捕获活跃的 RTCPeerConnection，用于每 5 秒拉取 RTP 通道统计
+    Class facCls = objc_getClass("RTCPeerConnectionFactory");
+    if (facCls) {
+        SEL pcSel = NSSelectorFromString(@"peerConnectionWithConfiguration:constraints:delegate:");
+        Method mPc = class_getInstanceMethod(facCls, pcSel);
+        if (mPc) {
+            static BOOL hookedPc = NO;
+            if (!hookedPc) {
+                hookedPc = YES;
+                IMP origPc = method_getImplementation(mPc);
+                method_setImplementation(mPc, imp_implementationWithBlock(^id(id _s, id cfg, id cons, id del) {
+                    id pc = ((id (*)(id, SEL, id, id, id))origPc)(_s, pcSel, cfg, cons, del);
+                    g_activePeerConn = pc;
+                    kp_log(@"[ROOM-MON] 已绑定 RTCPeerConnection=%p", pc);
+                    return pc;
+                }));
+            }
+        }
+    }
+
+    // 3. 监听 WebSocket 下行房间信令
+    Class wsCls = objc_getClass("__NSURLSessionWebSocketTask");
+    if (!wsCls) wsCls = objc_getClass("NSURLSessionWebSocketTask");
+    if (wsCls) {
+        SEL recvSel = @selector(receiveMessageWithCompletionHandler:);
+        Method mRecv = class_getInstanceMethod(wsCls, recvSel);
+        if (mRecv && !orig_ws_recvMsg) {
+            orig_ws_recvMsg = (void (*)(id, SEL, void (^)(NSURLSessionWebSocketMessage *, NSError *)))method_getImplementation(mRecv);
+            method_setImplementation(mRecv, (IMP)kp_hook_ws_recvMsg);
+        }
+    }
+
+    // 4. 启动每 5 秒一次的 RTP 通道统计定时器
+    static dispatch_source_t statsTimer = nil;
+    if (!statsTimer) {
+        statsTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        dispatch_source_set_timer(statsTimer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), 5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+        dispatch_source_set_event_handler(statsTimer, ^{
+            kp_poll_rtc_stats();
+        });
+        dispatch_resume(statsTimer);
+    }
+}
+
+// ==========================================
 // 9. 多开 Keychain 隔离（fishhook）
 // ==========================================
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
@@ -3109,11 +3324,11 @@ static void kp_build_rack_page(CGFloat w) {
     UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, KP_PAGE_Y, w, KP_PAGE_H)];
     sv.showsVerticalScrollIndicator = YES;
     sv.alwaysBounceVertical = YES;
-    sv.contentSize = CGSizeMake(w, 710);
+    sv.contentSize = CGSizeMake(w, 740);
     [g_panel addSubview:sv];
     g_pageRack = sv;
 
-    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 710)];
+    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 740)];
     [sv addSubview:c];
 
     UIColor *dim = [UIColor colorWithWhite:0.60 alpha:1.0];
@@ -3170,6 +3385,11 @@ static void kp_build_rack_page(CGFloat w) {
         g_understageEnabled = on;
         save_current_settings();
         kp_log(@"[understage] state=%s", on ? "ON" : "OFF");
+    });
+    y += 30;
+    kp_row_switch(c, y, w, @"房间与通道监听日志", g_roomMonitorEnabled, ^(BOOL on) {
+        g_roomMonitorEnabled = on;
+        kp_log(@"[ROOM-MON] 监听开关=%s", on ? "ON" : "OFF");
     });
     y += 30;
     kp_row_switch(c, y, w, @"屏蔽他人声音（远端护盾）", g_shieldRemote, ^(BOOL on) { g_shieldRemote = on; kp_shield_apply(); save_current_settings(); });
@@ -3653,6 +3873,7 @@ __attribute__((constructor)) static void kp_entry(void) {
     kp_setup_kaka_allow_hooks();
     kp_setup_understage_hooks();
     kp_setup_ws_unmute_hook();
+    kp_setup_room_monitor_hooks();
     kp_reverb_reset();
     kp_lim_reset();
 
