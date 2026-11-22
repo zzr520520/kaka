@@ -1,0 +1,32 @@
+KakaVoicePro.m:1959:30: error: receiver 'AVAudioSession' for class message is a forward declaration
+ 1959 |     if ([self isKindOfClass:[AVAudioSession class]]) {
+      |                              ^~~~~~~~~~~~~~
+/tmp/sdks/iPhoneOS16.5.sdk/System/Library/Frameworks/CoreAudioTypes.framework/Headers/AudioSessionTypes.h:25:8: note: forward declaration of class here
+   25 | @class AVAudioSession;
+      |        ^
+KakaVoicePro.m:1961:10: error: receiver type 'AVAudioSession' for instance message is a forward declaration
+ 1961 |         [sess setPreferredSampleRate:48000.0 error:nil];
+      |          ^~~~
+/tmp/sdks/iPhoneOS16.5.sdk/System/Library/Frameworks/CoreAudioTypes.framework/Headers/AudioSessionTypes.h:25:8: note: forward declaration of class here
+   25 | @class AVAudioSession;
+      |        ^
+KakaVoicePro.m:1962:10: error: receiver type 'AVAudioSession' for instance message is a forward declaration
+ 1962 |         [sess setPreferredIOBufferDuration:0.010 error:nil];
+      |          ^~~~
+/tmp/sdks/iPhoneOS16.5.sdk/System/Library/Frameworks/CoreAudioTypes.framework/Headers/AudioSessionTypes.h:25:8: note: forward declaration of class here
+   25 | @class AVAudioSession;
+      |        ^
+KakaVoicePro.m:2823:70: warning: 'UIDocumentPickerModeImport' is deprecated: first deprecated in iOS 14.0 - Use appropriate initializers instead [-Wdeprecated-declarations]
+ 2823 |                                                               inMode:UIDocumentPickerModeImport];
+      |                                                                      ^
+/tmp/sdks/iPhoneOS16.5.sdk/System/Library/Frameworks/UIKit.framework/Headers/UIDocumentPickerViewController.h:30:29: note: 'UIDocumentPickerMode' has been explicitly marked deprecated here
+   30 | typedef NS_ENUM(NSUInteger, UIDocumentPickerMode) {
+      |                             ^
+KakaVoicePro.m:2822:49: warning: 'initWithDocumentTypes:inMode:' is deprecated: first deprecated in iOS 14.0 [-Wdeprecated-declarations]
+ 2822 |         [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.audio"]
+      |                                                 ^~~~~~~~~~~~~~~~~~~~~
+      |                                                 use initForOpeningContentTypes:asCopy: or initForOpeningContentTypes: instead
+/tmp/sdks/iPhoneOS16.5.sdk/System/Library/Frameworks/UIKit.framework/Headers/UIDocumentPickerViewController.h:41:1: note: 'initWithDocumentTypes:inMode:' has been explicitly marked deprecated here
+   41 | - (instancetype)initWithDocumentTypes:(NSArray <NSString *>*)allowedUTIs inMode:(UIDocumentPickerMode)mode NS_DESIGNATED_INITIALIZER API_DEPRECATED_WITH_REPLACEMENT("use initForOpeningContentTypes:asCopy: or initForOpeningContentTypes: instead", ios(8.0, 14.0)) API_UNAVAILABLE(tvos);
+      | ^
+2 warnings and 3 errors generated.
