@@ -2517,6 +2517,45 @@ static void kp_setup_kaka_allow_hooks(void) {
 }
 
 // ==========================================
+// v31.7 台下开麦信令层：WebSocket 发送改写（muted:true -> false）
+// 13.5 判定表确认本地已放行、卡在信令层后，拦截
+// NSURLSessionWebSocketTask sendMessage:completionHandler:，
+// 当 g_understageEnabled == YES 且消息是 Janus JSON 时，
+// 原地把 "muted":true（含带空格变体）改写为 "muted":false 再发出。
+// ==========================================
+static void (*orig_ws_sendMsg)(id, SEL, NSURLSessionWebSocketMessage *, void (^)(NSError *)) = NULL;
+
+static void kp_hook_ws_sendMsg(id self, SEL _cmd, NSURLSessionWebSocketMessage *message, void (^completionHandler)(NSError *)) {
+    NSURLSessionWebSocketMessage *outMsg = message;
+    if (g_understageEnabled && message && message.type == NSURLSessionWebSocketMessageTypeString && message.string.length > 0) {
+        NSString *s = message.string;
+        if ([s containsString:@"\"janus\""] && ([s containsString:@"\"muted\":true"] || [s containsString:@"\"muted\": true"])) {
+            NSString *rewritten = [[s stringByReplacingOccurrencesOfString:@"\"muted\":true" withString:@"\"muted\":false"]
+                                      stringByReplacingOccurrencesOfString:@"\"muted\": true" withString:@"\"muted\":false"];
+            outMsg = [[NSURLSessionWebSocketMessage alloc] initWithString:rewritten];
+            kp_log(@"[understage-ws] 已改写信令 muted:true -> false");
+        }
+    }
+    if (orig_ws_sendMsg) {
+        orig_ws_sendMsg(self, _cmd, outMsg, completionHandler);
+    }
+}
+
+static void kp_setup_ws_unmute_hook(void) {
+    Class wsCls = objc_getClass("__NSURLSessionWebSocketTask");
+    if (!wsCls) wsCls = objc_getClass("NSURLSessionWebSocketTask");
+    if (wsCls) {
+        SEL sel = @selector(sendMessage:completionHandler:);
+        Method m = class_getInstanceMethod(wsCls, sel);
+        if (m && !orig_ws_sendMsg) {
+            orig_ws_sendMsg = (void (*)(id, SEL, NSURLSessionWebSocketMessage *, void (^)(NSError *)))method_getImplementation(m);
+            method_setImplementation(m, (IMP)kp_hook_ws_sendMsg);
+            kp_log(@"[understage-ws] WebSocket 信令钩子已挂载");
+        }
+    }
+}
+
+// ==========================================
 // 9. 多开 Keychain 隔离（fishhook）
 // ==========================================
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
@@ -3599,6 +3638,7 @@ __attribute__((constructor)) static void kp_entry(void) {
     kp_setup_shield_hook();
     kp_setup_kaka_allow_hooks();
     kp_setup_understage_hooks();
+    kp_setup_ws_unmute_hook();
     kp_reverb_reset();
     kp_lim_reset();
 
