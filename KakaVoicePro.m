@@ -1588,6 +1588,12 @@ static KPCustomAudioProcessor *g_customProc = nil;
 }
 
 - (void)audioProcessingProcess:(id)audioBuffer {
+    // v31.10：kp_hook_mixProc（KakaAudioMixer 出口）已全链接管上行处理，
+    // APM 浮点出口不再二次处理——防止同一份音频增益叠加两遍变成 -2.3dB 死砖墙方波。
+    //（下方旧处理体保留但不可达，直接 return）
+    (void)audioBuffer;
+    return;
+
     if (!g_dspEnabled || !audioBuffer) return;
 
     // 通过 runtime 读取 RTCAudioBuffer 的 channels / frames / rawBufferForChannel:
@@ -1733,7 +1739,7 @@ static KPCustomAudioProcessor *g_customProc = nil;
 // v31.9 房间与通道监听：下行混音统计（链式透传，不影响收听）
 // ==========================================
 static _Atomic BOOL g_roomMonitorEnabled = YES; // 房间与通道监听日志总开关
-static __weak id g_activePeerConn = nil;        // 当前活跃的 RTCPeerConnection
+static NSHashTable *g_allPeerConns = nil;       // v31.10：记录所有 RTCPeerConnection（KAKA 建两条：上行+下行）
 static id g_origRenderDel = nil;                // 链式保留官方渲染代理，绝不影响听别人说话
 
 @interface KPRenderMonitorProcessor : NSObject
@@ -2653,52 +2659,53 @@ static void kp_setup_ws_unmute_hook(void) {
 
 // 定时拉取 WebRTC 底层统计：上行/下行包数、丢包、抖动、audioLevel
 static void kp_poll_rtc_stats(void) {
-    if (!g_roomMonitorEnabled || !g_activePeerConn) return;
-    id pc = g_activePeerConn;
+    if (!g_roomMonitorEnabled || !g_allPeerConns) return;
+    NSArray *pcs = [g_allPeerConns allObjects];
     SEL statSel = NSSelectorFromString(@"statisticsWithCompletionHandler:");
-    if (![pc respondsToSelector:statSel]) return;
 
-    @try {
-        void (^cb)(id) = ^(id report) {
-            if (!report) return;
-            @try {
-                NSDictionary *stats = [report valueForKey:@"statistics"];
-                if (![stats isKindOfClass:[NSDictionary class]]) return;
+    for (id pc in pcs) {
+        if (![pc respondsToSelector:statSel]) continue;
+        @try {
+            void (^cb)(id) = ^(id report) {
+                if (!report) return;
+                @try {
+                    NSDictionary *stats = [report valueForKey:@"statistics"];
+                    if (![stats isKindOfClass:[NSDictionary class]]) return;
 
-                NSMutableString *line = [NSMutableString stringWithString:@"[RTC-STATS] "];
-                BOOL hasInfo = NO;
+                    NSMutableString *line = [NSMutableString stringWithFormat:@"[RTC-STATS pc=%p] ", pc];
+                    BOOL hasInfo = NO;
 
-                for (id key in stats) {
-                    id st = stats[key];
-                    NSString *type = [st valueForKey:@"type"];
-                    NSDictionary *vals = [st valueForKey:@"values"];
-                    if (![vals isKindOfClass:[NSDictionary class]]) continue;
+                    for (id key in stats) {
+                        id st = stats[key];
+                        NSString *type = [st valueForKey:@"type"];
+                        NSDictionary *vals = [st valueForKey:@"values"];
+                        if (![vals isKindOfClass:[NSDictionary class]]) continue;
 
-                    if ([type isEqualToString:@"outbound-rtp"]) {
-                        [line appendFormat:@"TX(pkts=%@ bytes=%@) ",
-                         vals[@"packetsSent"] ?: @"0", vals[@"bytesSent"] ?: @"0"];
-                        hasInfo = YES;
-                    } else if ([type isEqualToString:@"media-source"]) {
-                        if (vals[@"audioLevel"]) {
-                            double lvl = [vals[@"audioLevel"] doubleValue];
-                            [line appendFormat:@"MIC-LVL=%.0f%% ", lvl * 100.0];
+                        if ([type isEqualToString:@"outbound-rtp"]) {
+                            [line appendFormat:@"TX(pkts=%@ bytes=%@) ",
+                             vals[@"packetsSent"] ?: @"0", vals[@"bytesSent"] ?: @"0"];
+                            hasInfo = YES;
+                        } else if ([type isEqualToString:@"media-source"]) {
+                            if (vals[@"audioLevel"]) {
+                                double lvl = [vals[@"audioLevel"] doubleValue];
+                                [line appendFormat:@"MIC-LVL=%.0f%% ", lvl * 100.0];
+                                hasInfo = YES;
+                            }
+                        } else if ([type isEqualToString:@"inbound-rtp"]) {
+                            double lvl = vals[@"audioLevel"] ? [vals[@"audioLevel"] doubleValue] : 0.0;
+                            [line appendFormat:@"RX(pkts=%@ lost=%@ lvl=%.0f%%) ",
+                             vals[@"packetsReceived"] ?: @"0",
+                             vals[@"packetsLost"] ?: @"0",
+                             lvl * 100.0];
                             hasInfo = YES;
                         }
-                    } else if ([type isEqualToString:@"inbound-rtp"]) {
-                        double lvl = vals[@"audioLevel"] ? [vals[@"audioLevel"] doubleValue] : 0.0;
-                        [line appendFormat:@"RX(pkts=%@ lost=%@ jitter=%@ lvl=%.0f%%) ",
-                         vals[@"packetsReceived"] ?: @"0",
-                         vals[@"packetsLost"] ?: @"0",
-                         vals[@"jitter"] ?: @"0",
-                         lvl * 100.0];
-                        hasInfo = YES;
                     }
-                }
-                if (hasInfo) kp_log(@"%@", line);
-            } @catch (NSException *e) {}
-        };
-        ((void (*)(id, SEL, id))objc_msgSend)(pc, statSel, cb);
-    } @catch (NSException *e) {}
+                    if (hasInfo) kp_log(@"%@", line);
+                } @catch (NSException *e) {}
+            };
+            ((void (*)(id, SEL, id))objc_msgSend)(pc, statSel, cb);
+        } @catch (NSException *e) {}
+    }
 }
 
 // 拦截 WebSocket 收包：打印 Janus 房间号、成员列表、谁在说话、谁被静音
@@ -2752,8 +2759,9 @@ static void kp_setup_room_monitor_hooks(void) {
                 IMP origPc = method_getImplementation(mPc);
                 method_setImplementation(mPc, imp_implementationWithBlock(^id(id _s, id cfg, id cons, id del) {
                     id pc = ((id (*)(id, SEL, id, id, id))origPc)(_s, pcSel, cfg, cons, del);
-                    g_activePeerConn = pc;
-                    kp_log(@"[ROOM-MON] 已绑定 RTCPeerConnection=%p", pc);
+                    if (!g_allPeerConns) g_allPeerConns = [NSHashTable weakObjectsHashTable];
+                    if (pc) [g_allPeerConns addObject:pc];
+                    kp_log(@"[ROOM-MON] 已记录 RTCPeerConnection=%p (总数=%lu)", pc, (unsigned long)g_allPeerConns.count);
                     return pc;
                 }));
             }
