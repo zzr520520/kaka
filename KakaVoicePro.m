@@ -1956,10 +1956,14 @@ static BOOL kp_hook_av_setCatModeOpt(id self, SEL _cmd, NSString *cat, NSString 
     BOOL ok = orig_av_setCatModeOpt ? orig_av_setCatModeOpt(self, _cmd, cat, m, opt, err) : YES;
 
     // v31.8：强制锁定 48000Hz 宽带采样率 + 10ms 低延迟缓冲，防止退化为 16kHz 窄带通话音质
-    if ([self isKindOfClass:[AVAudioSession class]]) {
-        AVAudioSession *sess = (AVAudioSession *)self;
-        [sess setPreferredSampleRate:48000.0 error:nil];
-        [sess setPreferredIOBufferDuration:0.010 error:nil];
+    // （用 runtime 消息发送，AVAudioSession 仅前向声明，避免引入 AVFoundation 依赖）
+    static Class clsAVS = NULL;
+    if (!clsAVS) clsAVS = objc_getClass("AVAudioSession");
+    if (clsAVS && [(id)self isKindOfClass:clsAVS]) {
+        SEL sSR = @selector(setPreferredSampleRate:error:);
+        SEL sIO = @selector(setPreferredIOBufferDuration:error:);
+        ((void (*)(id, SEL, double, id))objc_msgSend)(self, sSR, 48000.0, nil);
+        ((void (*)(id, SEL, double, id))objc_msgSend)(self, sIO, 0.010, nil);
     }
     return ok;
 }
