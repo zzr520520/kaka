@@ -45,9 +45,9 @@ static _Atomic BOOL  g_lowCutEnabled     = YES;
 static _Atomic BOOL  g_throatEnabled     = YES;
 
 static _Atomic BOOL  g_compEnabled       = YES;
-static _Atomic float g_compThresh        = 0.08f;   // KVDSP：线性阈值约 -22dBFS，把每句话压紧
-static _Atomic float g_compRatio         = 4.5f;    // KVDSP：3人以上建议 4~6
-static _Atomic float g_preGain           = 1.80f;   // KVDSP：前级驱动增益
+static _Atomic float g_compThresh        = 0.14f;   // KVDSP：线性阈值约 -17dBFS，保留字头爆发力（v31.8）
+static _Atomic float g_compRatio         = 3.5f;    // KVDSP：3.5:1 适度压密，连续而不成死方波
+static _Atomic float g_preGain           = 1.35f;   // KVDSP：前级驱动增益（v31.8：原 1.80f 易顶爆）
 static _Atomic BOOL  g_forceDefaultMode  = YES;     // 强制将 VoiceChat 改为 Default，甩掉苹果通话模式压制
 static _Atomic BOOL  g_disableDucking    = YES;     // 关闭系统/WebRTC 自动闪避
 static _Atomic BOOL  g_understageEnabled = NO;      // 台下开麦：强开采集投递 + 强解本地静音（默认关，防热麦）
@@ -65,7 +65,7 @@ static _Atomic float g_reverbRoom        = 0.85f;
 static _Atomic float g_reverbWet         = 0.25f;
 
 static _Atomic BOOL  g_limiterEnabled    = YES;
-static _Atomic float g_makeupGain        = 2.50f;
+static _Atomic float g_makeupGain        = 1.65f;   // v31.8：回调补偿增益，说话 RMS 稳在 -10dB 黄金穿透区
 static _Atomic float g_limiterCeiling    = 29800.0f; // 留出余量，避免混音阶段硬顶 100% 变方波
 
 static _Atomic BOOL  g_mixDspEnabled     = YES;
@@ -181,10 +181,10 @@ static void load_saved_settings(void) {
         }
     }
 
-    if (g_makeupGain < 1.0f || g_makeupGain > 10.0f)                g_makeupGain = 2.50f;  // KVDSP 默认补偿增益（v31.3：2.5~3.5 配 0.98 限幅）
+    if (g_makeupGain < 1.0f || g_makeupGain > 10.0f)                g_makeupGain = 1.65f;  // v31.8：-10dB 黄金穿透区默认
     if (g_limiterCeiling < 20000.0f || g_limiterCeiling > 32700.0f) g_limiterCeiling = 29800.0f;
-    if (g_compThresh < 0.05f || g_compThresh > 0.80f)               g_compThresh = 0.08f;  // KVDSP 默认门限
-    if (g_compRatio < 1.2f || g_compRatio > 10.0f)                  g_compRatio = 4.5f;    // KVDSP 默认压缩比
+    if (g_compThresh < 0.05f || g_compThresh > 0.80f)               g_compThresh = 0.14f;  // v31.8 默认门限
+    if (g_compRatio < 1.2f || g_compRatio > 10.0f)                  g_compRatio = 3.5f;    // v31.8 默认压缩比
     if (g_bgmVolume < 0.0f || g_bgmVolume > 2.0f)                   g_bgmVolume = 0.45f;   // v31.1：上限放宽到 200%
     if (g_reverbRoom < 0.0f || g_reverbRoom > 0.95f)                g_reverbRoom = 0.85f;
     if (g_reverbWet < 0.0f || g_reverbWet > 0.80f)                  g_reverbWet = 0.25f;
@@ -351,13 +351,15 @@ static void kp_rebuild_filter_bank(void) {
     int next = 1 - g_activeBank;
     KPFilterBank *B = &g_filterBanks[next];
 
-    // 报告 10/12 节：2.8kHz +5dB 制造频段区隔，3人以上混音里让人耳先抓住你
+    // v31.8：中高频频段区隔——2850Hz 存在感 + 4200Hz 字头锐度，多人混音里把每个字“切”出来
     if (g_priorityLoud) {
-        kp_rbj_peaking(&B->throat[0], fs, 2800.0f, 1.15f, 5.0f);
-        kp_rbj_peaking(&B->throat[1], fs, 3600.0f, 1.30f, 2.5f);
+        // 120Hz 以下彻底切干净（不跟男声低频泥潭抢能量）
+        // 2850Hz (+5.5dB) 提升人声存在感，4200Hz (+3.5dB) 提升辅音字头锐度
+        kp_rbj_peaking(&B->throat[0], fs, 2850.0f, 1.25f, 5.5f);
+        kp_rbj_peaking(&B->throat[1], fs, 4200.0f, 1.40f, 3.5f);
     } else {
         kp_rbj_peaking(&B->throat[0], fs, 2800.0f, 1.20f, 3.0f);
-        kp_rbj_peaking(&B->throat[1], fs, 220.0f,  1.20f, 1.5f);
+        kp_rbj_peaking(&B->throat[1], fs, 220.0f,  1.20f, 1.0f);
     }
 
     for (int i = 0; i < EQ10_BANDS; i++) {
@@ -1951,7 +1953,15 @@ static BOOL kp_hook_av_setCatModeOpt(id self, SEL _cmd, NSString *cat, NSString 
     if (g_forceDefaultMode && ([m isEqualToString:@"AVAudioSessionModeVoiceChat"] || [m isEqualToString:@"AVAudioSessionModeVideoChat"])) {
         m = @"AVAudioSessionModeDefault";
     }
-    return orig_av_setCatModeOpt ? orig_av_setCatModeOpt(self, _cmd, cat, m, opt, err) : YES;
+    BOOL ok = orig_av_setCatModeOpt ? orig_av_setCatModeOpt(self, _cmd, cat, m, opt, err) : YES;
+
+    // v31.8：强制锁定 48000Hz 宽带采样率 + 10ms 低延迟缓冲，防止退化为 16kHz 窄带通话音质
+    if ([self isKindOfClass:[AVAudioSession class]]) {
+        AVAudioSession *sess = (AVAudioSession *)self;
+        [sess setPreferredSampleRate:48000.0 error:nil];
+        [sess setPreferredIOBufferDuration:0.010 error:nil];
+    }
+    return ok;
 }
 
 static void kp_disable_agc(void) {
@@ -2947,12 +2957,12 @@ static void kp_toggle_master_lock(BOOL lock) {
         g_lowCutEnabled    = YES;
         g_throatEnabled    = YES;
         g_compEnabled      = YES;
-        g_compThresh       = 0.08f;
-        g_compRatio        = 4.5f;
+        g_compThresh       = 0.14f;
+        g_compRatio        = 3.5f;
         g_eq10Enabled      = YES;
         g_limiterEnabled   = YES;
         g_limiterCeiling   = 29800.0f;
-        g_makeupGain       = 2.50f;
+        g_makeupGain       = 1.65f;
         g_shieldRemote     = YES;
         g_shieldLowOnly    = YES;
         kp_shield_apply();
